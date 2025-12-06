@@ -27,14 +27,27 @@ app.add_middleware(
 
 
 EXPECTED_TOKEN = "new-token-abc"
-DEPRECATED_TOKENS = {
-  "legacy-token-abc": "API key legacy-token-abc has been deprecated. Request a new token.",
-  "legacy-token-eu": "Region-specific legacy token detected. Please rotate credentials.",
+BLOCKED_TOKENS = {
+  "blocked-token-001": "API key blocked due to suspicious activity. Contact support.",
+  "disabled-token-eu": "API key disabled in the EU region. Provision a new key.",
+}
+RATE_LIMITED_TOKENS = {
+  "spiky-token": {
+    "message": "Token request burst detected. Throttling applied.",
+    "limit": 2,
+    "window_seconds": 30,
+  },
+  "chatty-token": {
+    "message": "Too many requests for this API key. Wait before retrying.",
+    "limit": 5,
+    "window_seconds": 60,
+  },
 }
 TOKEN_REQUEST_LIMIT = 5
 TOKEN_REQUEST_WINDOW_SECONDS = 60
 _token_request_count = 0
 _token_window_start = time.monotonic()
+_token_rate_state: Dict[str, Dict[str, Any]] = {}
 
 
 class ExternalApiResponse(BaseModel):
@@ -54,6 +67,15 @@ class RefreshTokenResponse(BaseModel):
   """Payload returned from /refresh-token."""
 
   token: str
+  action: str
+  message: str
+
+
+class RefreshTokenRequest(BaseModel):
+  """Payload accepted by /refresh-token."""
+
+  previous_token: str | None = None
+  failure_status: int | None = None
 
 
 class RefreshTokenError(BaseModel):
@@ -79,6 +101,32 @@ def _remaining_window_seconds(now: float) -> int:
   return max(1, int(remaining))
 
 
+def _enforce_token_rate_limit(token: str, cfg: Dict[str, Any], now: float) -> None:
+  """Rate-limit specific API keys to simulate exhausted quotas."""
+  state = _token_rate_state.get(token)
+  window = cfg["window_seconds"]
+  if not state or now - state["window_start"] >= window:
+    _token_rate_state[token] = {
+      "count": 0,
+      "window_start": now,
+    }
+    state = _token_rate_state[token]
+
+  if state["count"] >= cfg["limit"]:
+    retry_after = window - (now - state["window_start"])
+    retry_after_seconds = max(1, int(retry_after))
+    raise HTTPException(
+      status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+      detail={
+        "error": cfg["message"],
+        "retry_after_seconds": retry_after_seconds,
+      },
+      headers={"Retry-After": str(retry_after_seconds)},
+    )
+
+  state["count"] += 1
+
+
 @app.get(
   "/external-api",
   response_model=ExternalApiResponse,
@@ -87,8 +135,12 @@ def _remaining_window_seconds(now: float) -> int:
       "description": "Missing or invalid credentials",
       "model": ExternalApiError,
     },
-    status.HTTP_410_GONE: {
-      "description": "Deprecated API token used",
+    status.HTTP_403_FORBIDDEN: {
+      "description": "API key blocked or disabled",
+      "model": ExternalApiError,
+    },
+    status.HTTP_429_TOO_MANY_REQUESTS: {
+      "description": "API key rate limit exceeded",
       "model": ExternalApiError,
     },
     status.HTTP_503_SERVICE_UNAVAILABLE: {
@@ -108,14 +160,19 @@ async def external_api(
       detail={"error": "Missing bearer token"},
     )
 
+  now = time.monotonic()
   token = authorization.replace("Bearer ", "", 1).strip()
-  if token in DEPRECATED_TOKENS:
+
+  if token in BLOCKED_TOKENS:
     raise HTTPException(
-      status_code=status.HTTP_410_GONE,
-      detail={"error": DEPRECATED_TOKENS[token]},
+      status_code=status.HTTP_403_FORBIDDEN,
+      detail={"error": BLOCKED_TOKENS[token]},
     )
 
-  if token != EXPECTED_TOKEN:
+  if token in RATE_LIMITED_TOKENS:
+    _enforce_token_rate_limit(token, RATE_LIMITED_TOKENS[token], now)
+
+  if token != EXPECTED_TOKEN and token not in RATE_LIMITED_TOKENS:
     raise HTTPException(
       status_code=status.HTTP_401_UNAUTHORIZED,
       detail={"error": "Invalid token"},
@@ -141,7 +198,7 @@ async def external_api(
   },
   status_code=status.HTTP_200_OK,
 )
-async def refresh_token() -> RefreshTokenResponse:
+async def refresh_token(payload: RefreshTokenRequest | None = None) -> RefreshTokenResponse:
   """Return a fresh token to satisfy the external API."""
   global _token_request_count
   now = time.monotonic()
@@ -159,7 +216,18 @@ async def refresh_token() -> RefreshTokenResponse:
     )
 
   _token_request_count += 1
-  return RefreshTokenResponse(token=EXPECTED_TOKEN)
+  request_context = payload or RefreshTokenRequest()
+
+  action = "refresh_token"
+  message = "Issued a standard replacement token."
+  previous_token = request_context.previous_token or ""
+  if previous_token in BLOCKED_TOKENS:
+    action = "rotate_token"
+    message = BLOCKED_TOKENS[previous_token]
+  elif previous_token in RATE_LIMITED_TOKENS:
+    message = RATE_LIMITED_TOKENS[previous_token]["message"]
+
+  return RefreshTokenResponse(token=EXPECTED_TOKEN, action=action, message=message)
 
 
 class LogPayload(BaseModel):

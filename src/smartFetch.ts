@@ -13,7 +13,7 @@ export interface SmartFetchConfig {
   backoffBaseMs?: number;
   backoffMaxMs?: number;
   logger?: (entry: SmartFetchLogEntry) => void;
-  tokenRefresher?: () => Promise<string>;
+  tokenRefresher?: (context: TokenRecoveryContext) => Promise<string | null | undefined>;
   jitterRatio?: number;
   retryBudget?: RetryBudgetConfig;
 }
@@ -39,6 +39,14 @@ export interface SmartFetchResult<T = unknown> {
   data: T | null;
   meta: SmartFetchMeta;
   error: { status?: number; message: string; body?: unknown } | null;
+}
+
+export interface TokenRecoveryContext {
+  status: number;
+  attempt: number;
+  region: string;
+  previousToken?: string | null;
+  error?: string;
 }
 
 export interface RetryBudgetConfig {
@@ -95,6 +103,23 @@ const isRetryable = (
 };
 
 const shouldFallbackRegion = (status?: number) => status === 503;
+
+const extractTokenFromHeader = (value?: string | null) => {
+  if (!value) {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (trimmed.toLowerCase().startsWith('bearer ')) {
+    return trimmed.slice(7).trim();
+  }
+
+  return trimmed;
+};
 
 const RETRY_BUDGET_DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1_000;
 
@@ -203,9 +228,17 @@ export async function smartFetch<T = unknown>(
       ? trimmed
       : `Bearer ${trimmed}`;
   };
+  let currentTokenValue = extractTokenFromHeader(dynamicHeaders.get('Authorization'));
+  const updateAuthorizationHeader = (token: string) => {
+    const extracted = extractTokenFromHeader(token);
+    if (!extracted) {
+      return;
+    }
+    currentTokenValue = extracted;
+    dynamicHeaders.set('Authorization', formatToken(extracted));
+  };
 
-  let tokenRefreshAttempted = false;
-  let deprecatedTokenHandled = false;
+  let tokenRecoveryAttempted = false;
 
   for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
     const currentRegion = regions[attempt % regions.length] || '';
@@ -249,70 +282,44 @@ export async function smartFetch<T = unknown>(
         };
       }
 
-      if (
-        status === 401 &&
+      const shouldAttemptTokenRecovery =
         tokenRefresher &&
-        !tokenRefreshAttempted
-      ) {
-        tokenRefreshAttempted = true;
-        try {
-          const nextToken = await tokenRefresher();
-          if (nextToken) {
-            dynamicHeaders.set(
-              'Authorization',
-              formatToken(nextToken),
-            );
-            fixActionsForAttempt.push('refresh_token');
-            fixActionSet.add('refresh_token');
-            logEntry.fixActions = [...fixActionsForAttempt];
-            logEntry.error = 'Unauthorized. Token refreshed.';
-            attempts.push(logEntry);
-            logger?.(logEntry);
-            continue;
-          }
-        } catch (refreshError) {
-          const message =
-            refreshError instanceof Error
-              ? refreshError.message
-              : 'Token refresh failed';
-          lastError = {
-            status,
-            message,
-          };
-          logEntry.fixActions = [...fixActionsForAttempt];
-          logEntry.error = message;
-          attempts.push(logEntry);
-          logger?.(logEntry);
-          break;
-        }
-      }
+        !tokenRecoveryAttempted &&
+        (status === 401 || status === 403 || status === 410 || status === 429);
 
-      if (
-        status === 410 &&
-        tokenRefresher &&
-        !deprecatedTokenHandled
-      ) {
-        deprecatedTokenHandled = true;
+      if (shouldAttemptTokenRecovery && tokenRefresher) {
+        tokenRecoveryAttempted = true;
+        const recoveryAction: Extract<FixAction, 'refresh_token' | 'rotate_token'> =
+          status === 401 || status === 429 ? 'refresh_token' : 'rotate_token';
+        const recoveryMessage =
+          recoveryAction === 'refresh_token'
+            ? 'Token refreshed after provider rejection.'
+            : 'Token rotated after provider notice.';
+
+        const recoveryContext: TokenRecoveryContext = {
+          status,
+          attempt: attempt + 1,
+          region: currentRegion || 'default',
+          previousToken: currentTokenValue,
+        };
+
         try {
-          const rotatedToken = await tokenRefresher();
-          if (rotatedToken) {
-            dynamicHeaders.set(
-              'Authorization',
-              formatToken(rotatedToken),
-            );
-            fixActionsForAttempt.push('rotate_token');
-            fixActionSet.add('rotate_token');
+          const nextToken = await tokenRefresher(recoveryContext);
+          if (nextToken) {
+            updateAuthorizationHeader(nextToken);
+            fixActionsForAttempt.push(recoveryAction);
+            fixActionSet.add(recoveryAction);
             logEntry.fixActions = [...fixActionsForAttempt];
-            logEntry.error = 'Deprecated token replaced.';
+            logEntry.error = recoveryMessage;
             attempts.push(logEntry);
             logger?.(logEntry);
             continue;
           }
-        } catch (rotationError) {
+        } catch (recoveryError) {
           const message =
-            rotationError instanceof Error
-              ? rotationError.message
-              : 'Token rotation failed';
+            recoveryError instanceof Error
+              ? recoveryError.message
+              : 'Token recovery failed';
           lastError = {
             status,
             message,
@@ -323,6 +330,16 @@ export async function smartFetch<T = unknown>(
           logger?.(logEntry);
           break;
         }
+
+        lastError = {
+          status,
+          message: 'Token recovery unavailable.',
+        };
+        logEntry.fixActions = [...fixActionsForAttempt];
+        logEntry.error = lastError.message;
+        attempts.push(logEntry);
+        logger?.(logEntry);
+        break;
       }
 
       if (shouldRetry) {

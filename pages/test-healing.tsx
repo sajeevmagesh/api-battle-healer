@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { smartFetch, SmartFetchResult } from '../src/smartFetch';
+import { smartFetch, SmartFetchResult, type TokenRecoveryContext } from '../src/smartFetch';
 
 type ApiResult = SmartFetchResult<Record<string, unknown>>;
 
@@ -15,14 +15,14 @@ const TOKEN_SCENARIOS = [
     token: 'bad-token',
   },
   {
-    id: 'legacy-us',
-    label: 'Deprecated token legacy-token-abc (410)',
-    token: 'legacy-token-abc',
+    id: 'blocked',
+    label: 'Blocked token blocked-token-001 (403)',
+    token: 'blocked-token-001',
   },
   {
-    id: 'legacy-eu',
-    label: 'Deprecated token legacy-token-eu (410)',
-    token: 'legacy-token-eu',
+    id: 'rate-limited',
+    label: 'Rate-limited token spiky-token (429 after bursts)',
+    token: 'spiky-token',
   },
 ] as const;
 
@@ -62,9 +62,17 @@ export default function TestHealingPage() {
     setIsLoading(true);
     setResult(null);
     try {
-      const tokenRefresher = async () => {
+      const tokenRefresher = async (context: TokenRecoveryContext) => {
         const res = await fetch('http://localhost:8000/refresh-token', {
           method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            previous_token: context.previousToken,
+            failure_status: context.status,
+            attempt: context.attempt,
+          }),
         });
         if (!res.ok) {
           throw new Error('Failed to refresh or rotate token');
