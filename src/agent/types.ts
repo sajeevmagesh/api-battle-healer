@@ -27,6 +27,7 @@ export interface HealingObservation {
 export interface ToolkitContext {
   backendBaseUrl: string;
   requestId: string;
+  correlationId: string;
 }
 
 export interface HealingState {
@@ -35,6 +36,8 @@ export interface HealingState {
   options: RequestInit;
   regions: string[];
   regionIndex: number;
+  regionHistory: string[];
+  regionHealth: Record<string, 'healthy' | 'unhealthy' | 'deprecated'>;
   token?: string;
   cachedResponse?: unknown;
   schemaHints?: Record<string, unknown>;
@@ -43,6 +46,7 @@ export interface HealingState {
   maxCycles: number;
   cyclesUsed: number;
   queued?: boolean;
+  correlationId: string;
 }
 
 export interface HealingIntervention {
@@ -57,6 +61,7 @@ export interface HealingAgentParams {
   options: RequestInit;
   regions?: string[];
   requestId?: string;
+  correlationId?: string;
   maxCycles?: number;
   tokenProvider: () => Promise<string>;
   backendBaseUrl: string;

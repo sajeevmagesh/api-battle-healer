@@ -1,10 +1,12 @@
 import { fetchTestApiKey } from '../apiKeys';
+import { findRegionByEndpoint } from '../config/routing';
 import {
   HealingActionType,
   HealingIntervention,
   HealingState,
   ToolkitContext,
 } from './types';
+import { resolveNextRegion } from './routing';
 
 const DEFAULT_HEADERS = {
   'Content-Type': 'application/json',
@@ -57,12 +59,32 @@ async function refreshCredentials(
 async function switchRegion(
   state: HealingState,
 ): Promise<{ updatedState: HealingState; intervention: HealingIntervention }> {
-  const nextIndex = (state.regionIndex + 1) % state.regions.length;
-  const updated = { ...state, regionIndex: nextIndex };
+  const currentRegionEndpoint = state.regions[state.regionIndex] || '';
+  const currentRegionNode = findRegionByEndpoint(currentRegionEndpoint);
+  const nextNode = resolveNextRegion(currentRegionNode?.id, state.regionHealth);
+  if (!nextNode) {
+    return {
+      updatedState: state,
+      intervention: createIntervention(state, 'switch_region', 'No alternate region available'),
+    };
+  }
+  let nextIndex = state.regions.findIndex((item) => item === nextNode.endpoint);
+  if (nextIndex === -1) {
+    nextIndex = state.regions.length;
+  }
+  const updatedRegions =
+    nextIndex < state.regions.length
+      ? state.regions
+      : [...state.regions, nextNode.endpoint];
+  const updated = {
+    ...state,
+    regions: updatedRegions,
+    regionIndex: nextIndex,
+  };
   return {
     updatedState: updated,
     intervention: createIntervention(state, 'switch_region', 'Switching to alternate region', {
-      region: state.regions[nextIndex],
+      region: nextNode.id,
     }),
   };
 }
@@ -144,15 +166,34 @@ async function queueForRecovery(
   context: ToolkitContext,
   params: Record<string, unknown>,
 ) {
+  const lastObservation = state.attempts.at(-1);
+  const activeRegion = state.regions[state.regionIndex] || 'default';
+  const method = (state.options.method || 'GET').toUpperCase();
+  const sanitizedHeaders = sanitizeHeaders(headersToObject(state.options.headers));
+  const body =
+    typeof state.options.body === 'string'
+      ? state.options.body
+      : state.options.body
+        ? JSON.stringify(state.options.body)
+        : undefined;
   await fetch(`${context.backendBaseUrl}/queue-failed`, {
     method: 'POST',
     headers: DEFAULT_HEADERS,
     body: JSON.stringify({
-      operation: 'external-api',
-      payload: {
-        requestId: state.requestId,
-        params,
-      },
+      request_id: state.requestId,
+      correlation_id: context.correlationId,
+      endpoint: (params.endpoint as string) || 'external-api',
+      provider: (params.provider as string) || 'battle-healer',
+      region: activeRegion,
+      method,
+      url: state.url,
+      headers: sanitizedHeaders,
+      body,
+      error_type: lastObservation?.error?.message || undefined,
+      error_message: lastObservation?.error?.message,
+      error_status: lastObservation?.error?.status,
+      timestamp: lastObservation?.timestamp ?? new Date().toISOString(),
+      retry_count: (lastObservation?.meta.retries ?? 0) as number,
     }),
   });
   const updated = { ...state, queued: true };
@@ -165,6 +206,29 @@ async function queueForRecovery(
       params,
     ),
   };
+}
+
+function headersToObject(init?: HeadersInit): Record<string, string> {
+  if (!init) {
+    return {};
+  }
+  const headers = new Headers(init);
+  const result: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    result[key] = value;
+  });
+  return result;
+}
+
+function sanitizeHeaders(headers: Record<string, string>): Record<string, string> {
+  const blocked = new Set(['authorization', 'proxy-authorization', 'cookie']);
+  return Object.entries(headers).reduce<Record<string, string>>((acc, [key, value]) => {
+    if (blocked.has(key.toLowerCase())) {
+      return acc;
+    }
+    acc[key] = value;
+    return acc;
+  }, {});
 }
 
 function createIntervention(

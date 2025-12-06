@@ -1,4 +1,6 @@
 import { smartFetch } from '../smartFetch';
+import { ROUTING_TREE, findRegionByEndpoint } from '../config/routing';
+import { resolveNextRegion } from './routing';
 import { getHealingDecision } from './geminiPlanner';
 import { executeAction } from './toolkit';
 import {
@@ -14,13 +16,18 @@ export async function runHealingAgent<T = unknown>(
   const {
     url,
     options,
-    regions = ['http://localhost:8000'],
-    requestId = `req-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    regions = ROUTING_TREE.children?.map((node) => node.endpoint) ?? [
+      'http://localhost:8000',
+    ],
+    requestId: providedRequestId,
     maxCycles = 6,
     tokenProvider,
     backendBaseUrl,
   } = params;
 
+  const requestId =
+    providedRequestId || `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const correlationId = params.correlationId || requestId;
   const initialToken = await tokenProvider();
 
   let state: HealingState = {
@@ -29,15 +36,20 @@ export async function runHealingAgent<T = unknown>(
     options,
     regions,
     regionIndex: 0,
+    regionHistory: [],
+    regionHealth: {},
     token: initialToken,
     attempts: [],
     interventions: [],
     maxCycles,
     cyclesUsed: 0,
+    correlationId,
   };
 
   while (state.cyclesUsed < state.maxCycles) {
     const region = state.regions[state.regionIndex] || '';
+    const currentRegionNode = findRegionByEndpoint(region);
+    const currentRegionId = currentRegionNode?.id ?? region;
     const headerBag = new Headers(state.options.headers ?? undefined);
     if (state.token) {
       headerBag.set('Authorization', `Bearer ${state.token}`);
@@ -51,12 +63,17 @@ export async function runHealingAgent<T = unknown>(
       regions: [region],
       maxRetries: 0,
       logger: console.log,
+      correlationId,
     });
 
     if (!result.error) {
       state = {
         ...state,
         cachedResponse: result.data,
+        regionHealth: {
+          ...state.regionHealth,
+          [currentRegionId]: 'healthy',
+        },
       };
       return {
         success: true,
@@ -72,17 +89,28 @@ export async function runHealingAgent<T = unknown>(
       timestamp: new Date().toISOString(),
       triggerHints: result.error.body as Record<string, unknown>,
     };
+    const unhealthyStatus =
+      result.error?.status === 410
+        ? 'deprecated'
+        : result.error?.status === 503 || result.error?.status === 429
+          ? 'unhealthy'
+          : undefined;
+
     state = {
       ...state,
       attempts: [...state.attempts, observation],
       cyclesUsed: state.cyclesUsed + 1,
+      regionHistory: [...state.regionHistory, currentRegionId],
+      regionHealth: unhealthyStatus
+        ? { ...state.regionHealth, [currentRegionId]: unhealthyStatus }
+        : state.regionHealth,
     };
 
     const decision = await getHealingDecision(state, observation);
     const { updatedState, intervention } = await executeAction(
       decision.action,
       state,
-      { backendBaseUrl, requestId: state.requestId },
+      { backendBaseUrl, requestId: state.requestId, correlationId: state.correlationId },
       decision.params,
     );
     updatedState.interventions = [...updatedState.interventions, intervention];

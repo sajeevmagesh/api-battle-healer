@@ -29,7 +29,7 @@ uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
    - Inspect or mutate per-token quota/ budget counters to force 402/429 behavior.
 
 4. `GET|POST /queue-failed`
-   - Append failures into a recovery queue, with overflow simulation once the queue fills up.
+   - `POST` accepts structured request metadata (correlation ID, endpoint, provider, region, sanitized headers/body, error context) and enqueues it for async replay. A background worker replays queued requests with exponential backoff, marks entries as completed/dead, and emits `QUEUE_OVERFLOW` / `QUEUE_REPLAY_*` warnings. Persistence & external notifications are still TODO for now.
 
 5. `POST /mock-response`
    - Return graceful-degradation payloads or feed your own fallback body.
@@ -52,6 +52,13 @@ uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 
 8. `POST /simulate-budget`
    - Body: `{ "token": "...", "call_budget_delta": -10 }` etc.
+
+### Queueing & Async Recovery
+
+- `POST /queue-failed` accepts the failed request metadata described above. Entries are stored in-memory for now (look for the inline TODOs if you want to swap in SQLite/Redis/SQS for durability).
+- A FastAPI startup task replays items every few seconds using exponential backoff. Successes are removed from the queue; repeated failures eventually become `dead` entries.
+- Overflow + dead-letter thresholds emit structured `QUEUE_OVERFLOW`, `QUEUE_RETRY_SCHEDULED`, and `QUEUE_REPLAY_DEAD` logs that always carry the correlation ID, provider, region, and endpoint. Hook these into Slack/webhooks where the TODO comments sit today.
+- Set `DISABLE_QUEUE_WORKER=1` in your `.env` if you need to turn the worker off locally (for tests or demos).
 
 ### Example cURL Commands
 

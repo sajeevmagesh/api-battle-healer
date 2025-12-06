@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { smartFetch, SmartFetchResult, type TokenRecoveryContext } from '../src/smartFetch';
+import { ROUTING_TREE, flattenRoutingTree } from '../src/config/routing';
 
 type ApiResult = SmartFetchResult<Record<string, unknown>>;
 
@@ -29,6 +30,9 @@ const TOKEN_SCENARIOS = [
 const makeSessionKey = () =>
   `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 const INITIAL_SESSION_KEY = 'session-initial';
+const ROUTING_PRESET = ROUTING_TREE.children
+  ?.map((node) => node.endpoint)
+  .join(', ') ?? 'http://localhost:8000';
 
 export default function TestHealingPage() {
   const [result, setResult] = useState<ApiResult | null>(null);
@@ -57,6 +61,11 @@ export default function TestHealingPage() {
       .filter(Boolean);
     return values.length ? values : [''];
   }, [regionsInput]);
+
+  const handleLoadFallbackDemo = () => {
+    setRegionsInput(ROUTING_PRESET);
+    setMaxRetries((current) => Math.max(current, 3));
+  };
 
   const handleClick = async () => {
     setIsLoading(true);
@@ -131,7 +140,8 @@ export default function TestHealingPage() {
       <h1>Self-Healing API Playground</h1>
       <p>
         Configure a scenario and run <code>smartFetch</code> to visualize how retries,
-        token rotation, and budgets behave against the FastAPI mock server.
+        token rotation, budgets, and region fallback behave against the FastAPI mock
+        server.
       </p>
 
       <section
@@ -192,6 +202,16 @@ export default function TestHealingPage() {
               onChange={(event) => setRegionsInput(event.target.value)}
               style={{ display: 'block', marginTop: 4, width: '100%' }}
             />
+            <small style={{ display: 'block', marginTop: 4 }}>
+              Tip: preload a multi-region fallback demo (first region deprecated)
+              <button
+                type="button"
+                onClick={handleLoadFallbackDemo}
+                style={{ marginLeft: 8 }}
+              >
+                preload fallback
+              </button>
+            </small>
           </label>
         </div>
       </section>

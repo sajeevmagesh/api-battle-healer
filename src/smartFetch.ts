@@ -16,6 +16,7 @@ export interface SmartFetchConfig {
   tokenRefresher?: (context: TokenRecoveryContext) => Promise<string | null | undefined>;
   jitterRatio?: number;
   retryBudget?: RetryBudgetConfig;
+  correlationId?: string;
 }
 
 export interface SmartFetchLogEntry {
@@ -25,6 +26,7 @@ export interface SmartFetchLogEntry {
   status?: number;
   error?: string;
   fixActions: FixAction[];
+  correlationId?: string;
 }
 
 export interface SmartFetchMeta {
@@ -33,6 +35,7 @@ export interface SmartFetchMeta {
   region: string;
   regionsTried: string[];
   fixActions: FixAction[];
+  correlationId: string;
 }
 
 export interface SmartFetchResult<T = unknown> {
@@ -56,7 +59,7 @@ export interface RetryBudgetConfig {
 }
 
 const DEFAULT_RETRY_CODES: Set<number> = (() => {
-  const set = new Set<number>([429]);
+  const set = new Set<number>([410, 429]);
   for (let status = 500; status <= 599; status += 1) {
     set.add(status);
   }
@@ -102,7 +105,7 @@ const isRetryable = (
   return false;
 };
 
-const shouldFallbackRegion = (status?: number) => status === 503;
+const shouldFallbackRegion = (status?: number) => status === 503 || status === 410;
 
 const extractTokenFromHeader = (value?: string | null) => {
   if (!value) {
@@ -209,6 +212,7 @@ export async function smartFetch<T = unknown>(
     tokenRefresher,
     jitterRatio = 0.25,
     retryBudget,
+    correlationId: providedCorrelationId,
   } = config;
 
   const retryCodeSet = retryStatusCodes?.length
@@ -221,6 +225,10 @@ export async function smartFetch<T = unknown>(
   const totalAttempts = maxRetries + 1;
   let lastError: SmartFetchResult['error'] = null;
 
+  const correlationId =
+    providedCorrelationId ||
+    `corr-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+
   const dynamicHeaders = new Headers(options.headers ?? undefined);
   const formatToken = (token: string) => {
     const trimmed = token.trim();
@@ -228,6 +236,7 @@ export async function smartFetch<T = unknown>(
       ? trimmed
       : `Bearer ${trimmed}`;
   };
+  dynamicHeaders.set('X-Correlation-Id', correlationId);
   let currentTokenValue = extractTokenFromHeader(dynamicHeaders.get('Authorization'));
   const updateAuthorizationHeader = (token: string) => {
     const extracted = extractTokenFromHeader(token);
@@ -249,6 +258,7 @@ export async function smartFetch<T = unknown>(
       ...options,
       headers: new Headers(dynamicHeaders),
     };
+    requestInit.headers.set('X-BattleHealer-Region', currentRegion || 'default');
 
     try {
       const response = await fetch(targetUrl, requestInit);
@@ -261,6 +271,7 @@ export async function smartFetch<T = unknown>(
         url: targetUrl,
         status,
         fixActions: [],
+        correlationId,
       };
 
       if (response.ok) {
@@ -277,6 +288,7 @@ export async function smartFetch<T = unknown>(
             region: currentRegion || 'default',
             regionsTried,
             fixActions: Array.from(fixActionSet),
+            correlationId,
           },
           error: null,
         };
@@ -285,7 +297,7 @@ export async function smartFetch<T = unknown>(
       const shouldAttemptTokenRecovery =
         tokenRefresher &&
         !tokenRecoveryAttempted &&
-        (status === 401 || status === 403 || status === 410 || status === 429);
+        (status === 401 || status === 403 || status === 429);
 
       if (shouldAttemptTokenRecovery && tokenRefresher) {
         tokenRecoveryAttempted = true;
@@ -467,6 +479,7 @@ export async function smartFetch<T = unknown>(
       region: attempts.at(-1)?.region || 'default',
       regionsTried,
       fixActions: Array.from(fixActionSet),
+      correlationId,
     },
     error: lastError ?? { message: 'Request failed' },
   };
