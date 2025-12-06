@@ -48,3 +48,23 @@ curl -i http://localhost:8000/log \
   -H 'Content-Type: application/json' \
   -d '{"event":"retry_attempt","metadata":{"attempt":1,"region":"us-east-1"}}'
 ```
+
+## Next.js Demo UI
+
+Install Node dependencies (already defined in `package.json`):
+
+```bash
+npm install
+```
+
+Run both servers in separate terminals:
+
+```bash
+# Terminal 1: FastAPI backend
+uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+
+# Terminal 2: Next.js frontend
+npm run dev
+```
+
+Open http://localhost:3000/test-healing to trigger the `smartFetch` demo against the mock backend.

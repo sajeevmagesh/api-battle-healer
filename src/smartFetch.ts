@@ -1,7 +1,8 @@
 type FixAction =
   | `retry_status_${number}`
   | `fallback_region_${string}`
-  | 'network_error';
+  | 'network_error'
+  | 'refresh_token';
 
 export interface SmartFetchConfig {
   maxRetries?: number;
@@ -10,6 +11,7 @@ export interface SmartFetchConfig {
   backoffBaseMs?: number;
   backoffMaxMs?: number;
   logger?: (entry: SmartFetchLogEntry) => void;
+  tokenRefresher?: () => Promise<string>;
 }
 
 export interface SmartFetchLogEntry {
@@ -96,6 +98,7 @@ export async function smartFetch<T = unknown>(
     backoffBaseMs = 300,
     backoffMaxMs = 3_000,
     logger,
+    tokenRefresher,
   } = config;
 
   const retryCodeSet = retryStatusCodes?.length
@@ -108,14 +111,28 @@ export async function smartFetch<T = unknown>(
   const totalAttempts = maxRetries + 1;
   let lastError: SmartFetchResult['error'] = null;
 
+  const dynamicHeaders = new Headers(options.headers ?? undefined);
+  const formatToken = (token: string) => {
+    const trimmed = token.trim();
+    return trimmed.toLowerCase().startsWith('bearer ')
+      ? trimmed
+      : `Bearer ${trimmed}`;
+  };
+
+  let tokenRefreshAttempted = false;
+
   for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
     const currentRegion = regions[attempt % regions.length] || '';
     const targetUrl = buildUrlForRegion(url, currentRegion);
     regionsTried.push(currentRegion || 'default');
     const fixActionsForAttempt: FixAction[] = [];
+    const requestInit: RequestInit = {
+      ...options,
+      headers: new Headers(dynamicHeaders),
+    };
 
     try {
-      const response = await fetch(targetUrl, options);
+      const response = await fetch(targetUrl, requestInit);
       const status = response.status;
       const shouldRetry = isRetryable(status, retryCodeSet);
 
@@ -144,6 +161,44 @@ export async function smartFetch<T = unknown>(
           },
           error: null,
         };
+      }
+
+      if (
+        status === 401 &&
+        tokenRefresher &&
+        !tokenRefreshAttempted
+      ) {
+        tokenRefreshAttempted = true;
+        try {
+          const nextToken = await tokenRefresher();
+          if (nextToken) {
+            dynamicHeaders.set(
+              'Authorization',
+              formatToken(nextToken),
+            );
+            fixActionsForAttempt.push('refresh_token');
+            fixActionSet.add('refresh_token');
+            logEntry.fixActions = [...fixActionsForAttempt];
+            logEntry.error = 'Unauthorized. Token refreshed.';
+            attempts.push(logEntry);
+            logger?.(logEntry);
+            continue;
+          }
+        } catch (refreshError) {
+          const message =
+            refreshError instanceof Error
+              ? refreshError.message
+              : 'Token refresh failed';
+          lastError = {
+            status,
+            message,
+          };
+          logEntry.fixActions = [...fixActionsForAttempt];
+          logEntry.error = message;
+          attempts.push(logEntry);
+          logger?.(logEntry);
+          break;
+        }
       }
 
       if (shouldRetry) {

@@ -12,9 +12,18 @@ import time
 from typing import Any, Dict
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI(title="Battle Healer Mock API", version="0.1.0")
+
+app.add_middleware(
+  CORSMiddleware,
+  allow_origins=["*"],
+  allow_credentials=True,
+  allow_methods=["*"],
+  allow_headers=["*"],
+)
 
 
 EXPECTED_TOKEN = "new-token-abc"
