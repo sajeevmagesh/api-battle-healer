@@ -2,7 +2,9 @@ type FixAction =
   | `retry_status_${number}`
   | `fallback_region_${string}`
   | 'network_error'
-  | 'refresh_token';
+  | 'refresh_token'
+  | 'retry_budget_exhausted'
+  | 'rotate_token';
 
 export interface SmartFetchConfig {
   maxRetries?: number;
@@ -12,6 +14,8 @@ export interface SmartFetchConfig {
   backoffMaxMs?: number;
   logger?: (entry: SmartFetchLogEntry) => void;
   tokenRefresher?: () => Promise<string>;
+  jitterRatio?: number;
+  retryBudget?: RetryBudgetConfig;
 }
 
 export interface SmartFetchLogEntry {
@@ -35,6 +39,12 @@ export interface SmartFetchResult<T = unknown> {
   data: T | null;
   meta: SmartFetchMeta;
   error: { status?: number; message: string; body?: unknown } | null;
+}
+
+export interface RetryBudgetConfig {
+  key: string;
+  limit: number;
+  windowMs?: number;
 }
 
 const DEFAULT_RETRY_CODES: Set<number> = (() => {
@@ -86,6 +96,79 @@ const isRetryable = (
 
 const shouldFallbackRegion = (status?: number) => status === 503;
 
+const RETRY_BUDGET_DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1_000;
+
+type RetryBudgetWindow = {
+  count: number;
+  windowStart: number;
+  windowMs: number;
+};
+
+const retryBudgetStore = new Map<string, RetryBudgetWindow>();
+
+const getRetryBudgetWindow = (config: RetryBudgetConfig) => {
+  const windowMs = config.windowMs ?? RETRY_BUDGET_DEFAULT_WINDOW_MS;
+  const now = Date.now();
+  const existing = retryBudgetStore.get(config.key);
+
+  if (!existing || now - existing.windowStart >= windowMs) {
+    const fresh: RetryBudgetWindow = {
+      count: 0,
+      windowStart: now,
+      windowMs,
+    };
+    retryBudgetStore.set(config.key, fresh);
+    return fresh;
+  }
+
+  return existing;
+};
+
+const consumeRetryBudget = (config: RetryBudgetConfig) => {
+  const bucket = getRetryBudgetWindow(config);
+  if (bucket.count >= config.limit) {
+    return false;
+  }
+  bucket.count += 1;
+  return true;
+};
+
+const parseRetryAfterMs = (response: Response) => {
+  const retryAfter = response.headers.get('retry-after');
+  if (!retryAfter) {
+    return null;
+  }
+
+  const seconds = Number(retryAfter);
+  if (!Number.isNaN(seconds)) {
+    return Math.max(0, seconds * 1_000);
+  }
+
+  const timestamp = Date.parse(retryAfter);
+  if (!Number.isNaN(timestamp)) {
+    return Math.max(0, timestamp - Date.now());
+  }
+
+  return null;
+};
+
+const calculateDelayMs = (
+  attempt: number,
+  baseMs: number,
+  maxMs: number,
+  jitterRatio: number,
+  overrideDelay?: number | null,
+) => {
+  if (typeof overrideDelay === 'number') {
+    return Math.min(maxMs, overrideDelay);
+  }
+
+  const exponential = Math.min(maxMs, baseMs * 2 ** attempt);
+  const jitterWindow = Math.max(0, exponential * jitterRatio);
+  const jitter = Math.random() * jitterWindow;
+  return Math.min(maxMs, exponential + jitter);
+};
+
 export async function smartFetch<T = unknown>(
   url: string,
   options: RequestInit = {},
@@ -99,6 +182,8 @@ export async function smartFetch<T = unknown>(
     backoffMaxMs = 3_000,
     logger,
     tokenRefresher,
+    jitterRatio = 0.25,
+    retryBudget,
   } = config;
 
   const retryCodeSet = retryStatusCodes?.length
@@ -120,6 +205,7 @@ export async function smartFetch<T = unknown>(
   };
 
   let tokenRefreshAttempted = false;
+  let deprecatedTokenHandled = false;
 
   for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
     const currentRegion = regions[attempt % regions.length] || '';
@@ -201,6 +287,44 @@ export async function smartFetch<T = unknown>(
         }
       }
 
+      if (
+        status === 410 &&
+        tokenRefresher &&
+        !deprecatedTokenHandled
+      ) {
+        deprecatedTokenHandled = true;
+        try {
+          const rotatedToken = await tokenRefresher();
+          if (rotatedToken) {
+            dynamicHeaders.set(
+              'Authorization',
+              formatToken(rotatedToken),
+            );
+            fixActionsForAttempt.push('rotate_token');
+            fixActionSet.add('rotate_token');
+            logEntry.fixActions = [...fixActionsForAttempt];
+            logEntry.error = 'Deprecated token replaced.';
+            attempts.push(logEntry);
+            logger?.(logEntry);
+            continue;
+          }
+        } catch (rotationError) {
+          const message =
+            rotationError instanceof Error
+              ? rotationError.message
+              : 'Token rotation failed';
+          lastError = {
+            status,
+            message,
+          };
+          logEntry.fixActions = [...fixActionsForAttempt];
+          logEntry.error = message;
+          attempts.push(logEntry);
+          logger?.(logEntry);
+          break;
+        }
+      }
+
       if (shouldRetry) {
         fixActionsForAttempt.push(`retry_status_${status}`);
         fixActionSet.add(`retry_status_${status}`);
@@ -214,19 +338,43 @@ export async function smartFetch<T = unknown>(
           fixActionSet.add(`fallback_region_${nextRegion}`);
         }
 
+        const hasAttemptsRemaining = attempt < totalAttempts - 1;
+
+        if (hasAttemptsRemaining) {
+          if (retryBudget && !consumeRetryBudget(retryBudget)) {
+            const message = `Retry budget exhausted for key "${retryBudget.key}".`;
+            fixActionsForAttempt.push('retry_budget_exhausted');
+            fixActionSet.add('retry_budget_exhausted');
+            logEntry.fixActions = [...fixActionsForAttempt];
+            logEntry.error = message;
+            attempts.push(logEntry);
+            logger?.(logEntry);
+            lastError = {
+              status,
+              message,
+            };
+            break;
+          }
+
+          logEntry.fixActions = fixActionsForAttempt;
+          attempts.push(logEntry);
+          logger?.(logEntry);
+
+          const retryAfterMs = parseRetryAfterMs(response);
+          const delay = calculateDelayMs(
+            attempt,
+            backoffBaseMs,
+            backoffMaxMs,
+            jitterRatio,
+            retryAfterMs,
+          );
+          await sleep(delay);
+          continue;
+        }
+
         logEntry.fixActions = fixActionsForAttempt;
         attempts.push(logEntry);
         logger?.(logEntry);
-
-        if (attempt < totalAttempts - 1) {
-          const delay = Math.min(
-            backoffMaxMs,
-            backoffBaseMs * 2 ** attempt,
-          );
-          const jitter = Math.random() * backoffBaseMs;
-          await sleep(delay + jitter);
-          continue;
-        }
       }
 
       const body = await safeParseBody(response);
@@ -252,19 +400,40 @@ export async function smartFetch<T = unknown>(
       };
       fixActionsForAttempt.push('network_error');
       fixActionSet.add('network_error');
+      const hasAttemptsRemaining = attempt < totalAttempts - 1;
+
+      if (hasAttemptsRemaining) {
+        if (retryBudget && !consumeRetryBudget(retryBudget)) {
+          const message = `Retry budget exhausted for key "${retryBudget.key}".`;
+          fixActionsForAttempt.push('retry_budget_exhausted');
+          fixActionSet.add('retry_budget_exhausted');
+          logEntry.error = `${errorMessage}. ${message}`;
+          logEntry.fixActions = fixActionsForAttempt;
+          attempts.push(logEntry);
+          logger?.(logEntry);
+          lastError = {
+            message,
+          };
+          break;
+        }
+
+        logEntry.fixActions = fixActionsForAttempt;
+        attempts.push(logEntry);
+        logger?.(logEntry);
+
+        const delay = calculateDelayMs(
+          attempt,
+          backoffBaseMs,
+          backoffMaxMs,
+          jitterRatio,
+        );
+        await sleep(delay);
+        continue;
+      }
+
       logEntry.fixActions = fixActionsForAttempt;
       attempts.push(logEntry);
       logger?.(logEntry);
-
-      if (attempt < totalAttempts - 1) {
-        const delay = Math.min(
-          backoffMaxMs,
-          backoffBaseMs * 2 ** attempt,
-        );
-        const jitter = Math.random() * backoffBaseMs;
-        await sleep(delay + jitter);
-        continue;
-      }
 
       lastError = {
         message: errorMessage,
