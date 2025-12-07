@@ -4,6 +4,7 @@ import { runHealingAgent } from '../src/agent';
 import type { HealingState } from '../src/agent/types';
 import type { DegradedResponse } from '../src/healing/degradedResponse';
 import { ROUTING_TREE, flattenRoutingTree } from '../src/config/routing';
+import { fetchTestApiKey } from '../src/apiKeys';
 
 type ApiResult = SmartFetchResult<Record<string, unknown>>;
 
@@ -37,6 +38,20 @@ const ROUTING_PRESET = ROUTING_TREE.children
   ?.map((node) => node.endpoint)
   .join(', ') ?? 'http://localhost:8000';
 const BACKEND_BASE_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+const IS_LOCAL_BACKEND = /localhost|127\.0\.0\.1/.test(BACKEND_BASE_URL);
+
+async function resetCredentialPool(baseUrl: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${baseUrl}/admin/reset-credentials`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    return response.ok;
+  } catch (error) {
+    console.warn('Failed to reset credential pool', error);
+    return false;
+  }
+}
 
 export default function TestHealingPage() {
   const [result, setResult] = useState<ApiResult | null>(null);
@@ -51,6 +66,8 @@ export default function TestHealingPage() {
   const [sessionKey, setSessionKey] = useState(INITIAL_SESSION_KEY);
   const [agentState, setAgentState] = useState<HealingState | null>(null);
   const [degradedInfo, setDegradedInfo] = useState<DegradedResponse<Record<string, unknown>> | null>(null);
+  const [keyNotice, setKeyNotice] = useState<string | null>(null);
+  const [autoIssuedToken, setAutoIssuedToken] = useState<string | null>(null);
 
   useEffect(() => {
     setSessionKey(makeSessionKey());
@@ -78,7 +95,59 @@ export default function TestHealingPage() {
     setResult(null);
     setAgentState(null);
     setDegradedInfo(null);
+    setKeyNotice(null);
     try {
+      const issueSandboxToken = async (): Promise<string | null> => {
+        if (autoIssuedToken) {
+          setKeyNotice('Rate limit detected. Reusing previously issued sandbox API key.');
+          if (!customToken.trim()) {
+            setCustomToken(autoIssuedToken);
+          }
+          return autoIssuedToken;
+        }
+        try {
+          const freshToken = await fetchTestApiKey('rate-limit-recovery');
+          setKeyNotice('Rate limit detected. Issued a fresh sandbox API key for continued retries.');
+          setAutoIssuedToken(freshToken);
+          if (!customToken.trim()) {
+            setCustomToken(freshToken);
+          }
+          return freshToken;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'unknown error';
+          const exhausted = /No credentials available/i.test(message);
+          if (IS_LOCAL_BACKEND && exhausted) {
+            setKeyNotice('Credential pool exhausted. Resetting sandbox credentials…');
+            const resetOk = await resetCredentialPool(BACKEND_BASE_URL);
+            if (resetOk) {
+              try {
+                const retried = await fetchTestApiKey('rate-limit-recovery');
+                setKeyNotice('Sandbox credentials reset. Issued a fresh API key.');
+                setAutoIssuedToken(retried);
+                if (!customToken.trim()) {
+                  setCustomToken(retried);
+                }
+                return retried;
+              } catch (retryError) {
+                const retryMessage = retryError instanceof Error ? retryError.message : 'unknown error';
+                setKeyNotice(
+                  `Credential pool reset but issuing a key still failed: ${retryMessage}`,
+                );
+                return null;
+              }
+            }
+            setKeyNotice(
+              'Credential pool exhausted and automatic reset failed. Restart the backend or provide a custom token.',
+            );
+            return null;
+          }
+          setKeyNotice(
+            `Rate limit detected but automatic token issuance failed: ${message}`,
+          );
+          return null;
+        }
+      };
+
       const baseRequestInit: RequestInit = {
         method: 'POST',
         headers: {
@@ -104,6 +173,18 @@ export default function TestHealingPage() {
           enableStaleCache: true,
           enableMock: true,
           cacheKey: `${targetPath}-${activeToken}`,
+        },
+        tokenRecoveryHandler: async (context) => {
+          if (context.status !== 429) {
+            return null;
+          }
+          if (!IS_LOCAL_BACKEND) {
+            setKeyNotice(
+              'Rate limit (429) detected against a remote backend. Please rotate your production credential manually.',
+            );
+            return null;
+          }
+          return issueSandboxToken();
         },
       });
       setAgentState(agentResult.state);
@@ -198,7 +279,10 @@ export default function TestHealingPage() {
               type="text"
               placeholder="Optional custom token"
               value={customToken}
-              onChange={(event) => setCustomToken(event.target.value)}
+              onChange={(event) => {
+                setCustomToken(event.target.value);
+                setAutoIssuedToken(null);
+              }}
               style={{ display: 'block', marginTop: 4, width: '100%' }}
             />
           </label>
@@ -303,6 +387,19 @@ export default function TestHealingPage() {
           Active token:&nbsp;
           <code>{activeToken}</code>
         </span>
+        {keyNotice && (
+          <div
+            style={{
+              marginTop: '1rem',
+              padding: '0.75rem',
+              borderRadius: 6,
+              background: '#ecfdf5',
+              border: '1px solid #34d399',
+            }}
+          >
+            <strong>API key notice:</strong> {keyNotice}
+          </div>
+        )}
       </section>
 
       <section>
@@ -433,6 +530,10 @@ export default function TestHealingPage() {
           )}
         </section>
       )}
+
+      {agentState?.decisionLog?.length ? (
+        <DecisionLog entries={agentState.decisionLog} />
+      ) : null}
     </main>
   );
 }
@@ -530,3 +631,50 @@ const Td = ({ children }: { children: ReactNode }) => (
     {children}
   </td>
 );
+
+function DecisionLog({ entries }: { entries: HealingState['decisionLog'] }) {
+  return (
+    <section
+      style={{
+        marginTop: '2rem',
+        border: '1px solid #ddd',
+        borderRadius: 8,
+        padding: '1rem',
+        background: '#fdfdfd',
+      }}
+    >
+      <h2>Decision Log</h2>
+      <div style={{ overflowX: 'auto' }}>
+        <table
+          style={{
+            width: '100%',
+            borderCollapse: 'collapse',
+          }}
+        >
+          <thead>
+            <tr>
+              <Th>Cycle</Th>
+              <Th>Action</Th>
+              <Th>Reason</Th>
+              <Th>Params</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {entries.map((entry) => (
+              <tr key={`${entry.cycle}-${entry.action}-${entry.reason}`}>
+                <Td>{entry.cycle + 1}</Td>
+                <Td>{entry.action}</Td>
+                <Td style={{ maxWidth: 320 }}>{entry.reason}</Td>
+                <Td style={{ maxWidth: 320 }}>
+                  {entry.params
+                    ? JSON.stringify(entry.params, null, 2)
+                    : '—'}
+                </Td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}

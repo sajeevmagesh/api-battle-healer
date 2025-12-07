@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ConfigDict
 
 from .credentials import (
+  credential_pool,
   get_credential_by_token,
   get_next_credential,
   mark_credential_status_by_token,
@@ -33,6 +34,7 @@ from .credentials import (
   predict_quota_action,
   record_usage,
   seconds_until_reset,
+  seed_default_credentials,
 )
 
 app = FastAPI(title="Battle Healer Mock API", version="0.1.0")
@@ -100,6 +102,12 @@ def log_healing_event(event: str, **context: Any) -> None:
   payload = {"event": event, **context}
   logger.info(json.dumps(payload, default=str))
   recent_log_events.append(payload)
+
+
+def _reset_token_issue_window() -> None:
+  global _token_request_count, _token_window_start
+  _token_request_count = 0
+  _token_window_start = time.monotonic()
 
 
 class ExternalApiResponse(BaseModel):
@@ -198,10 +206,13 @@ class MockResponseResult(BaseModel):
   """Response returned from /mock-response."""
 
   mock: Any
-  degradation: str = "mocked"
-  reason: str
-  source: str = "llm-mock"
-  original_error: str | None = None
+
+
+class ResetCredentialsResponse(BaseModel):
+  """Response payload returned from /admin/reset-credentials."""
+
+  status: str
+  total_credentials: int
 
 
 class LogPayload(BaseModel):
@@ -784,6 +795,22 @@ async def generate_api_key(payload: GenerateApiKeyRequest) -> GenerateApiKeyResp
     daily_call_limit=credential.daily_call_limit,
     used_calls=credential.used_calls,
   )
+
+
+@app.post(
+  "/admin/reset-credentials",
+  response_model=ResetCredentialsResponse,
+  status_code=status.HTTP_200_OK,
+)
+async def reset_credentials_endpoint() -> ResetCredentialsResponse:
+  """Reset the in-memory credential pool (development helper)."""
+  seed_default_credentials()
+  _reset_token_issue_window()
+  log_healing_event(
+    "CREDENTIAL_POOL_RESET",
+    total=len(credential_pool),
+  )
+  return ResetCredentialsResponse(status="reset", total_credentials=len(credential_pool))
 
 
 @app.post(

@@ -1,4 +1,4 @@
-import { SmartFetchMeta, SmartFetchResult } from '../smartFetch';
+import { SmartFetchMeta, SmartFetchResult, TokenRecoveryContext } from '../smartFetch';
 import type { DegradedResponse } from '../healing/degradedResponse';
 import type { DegradationConfig } from './degradation';
 
@@ -47,6 +47,7 @@ export interface HealingState {
   schemaHints?: SchemaHints;
   repairAttempts: number;
   degraded?: DegradedResponse<unknown>;
+  decisionLog: HealingDecisionLog[];
   attempts: HealingObservation[];
   interventions: HealingIntervention[];
   maxCycles: number;
@@ -72,6 +73,17 @@ export interface HealingAgentParams {
   tokenProvider: () => Promise<string>;
   backendBaseUrl: string;
   degradation?: DegradationConfig;
+  tokenRecoveryHandler?: (
+    context: TokenRecoveryContext,
+  ) => Promise<string | null | undefined>;
+  onTokenRecovery?: (event: TokenRecoveryEvent) => void;
+}
+
+export interface HealingDecisionLog {
+  cycle: number;
+  action: HealingActionType;
+  reason: string;
+  params?: Record<string, unknown>;
 }
 
 export interface HealingAgentResult<T = unknown> {
@@ -85,4 +97,9 @@ export interface HealingAgentResult<T = unknown> {
 export interface SchemaHints {
   fieldMap?: Record<string, string>;
   defaults?: Record<string, unknown>;
+}
+
+export interface TokenRecoveryEvent extends TokenRecoveryContext {
+  newToken?: string | null;
+  error?: string;
 }

@@ -1,4 +1,4 @@
-import { smartFetch } from '../smartFetch';
+import { smartFetch, TokenRecoveryContext } from '../smartFetch';
 import { ROUTING_TREE, findRegionByEndpoint } from '../config/routing';
 import { resolveNextRegion } from './routing';
 import { getHealingDecision } from './geminiPlanner';
@@ -32,6 +32,8 @@ export async function runHealingAgent<T = unknown>(
     tokenProvider,
     backendBaseUrl,
   } = params;
+  const tokenRecoveryHandler = params.tokenRecoveryHandler;
+  const onTokenRecovery = params.onTokenRecovery;
 
   const requestId =
     providedRequestId || `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -58,7 +60,31 @@ export async function runHealingAgent<T = unknown>(
     correlationId,
     repairAttempts: 0,
     degraded: createDegradedResponse<T | null>(null, 'none'),
+    decisionLog: [],
   };
+
+  const tokenRefresher =
+    tokenRecoveryHandler
+      ? async (context: TokenRecoveryContext) => {
+          try {
+            const nextToken = await tokenRecoveryHandler(context);
+            if (nextToken) {
+              state = { ...state, token: nextToken };
+            }
+            onTokenRecovery?.({
+              ...context,
+              newToken: nextToken ?? null,
+            });
+            return nextToken ?? null;
+          } catch (error) {
+            onTokenRecovery?.({
+              ...context,
+              error: error instanceof Error ? error.message : 'Token recovery failed',
+            });
+            throw error;
+          }
+        }
+      : undefined;
 
   while (state.cyclesUsed < state.maxCycles) {
     const region = state.regions[state.regionIndex] || '';
@@ -78,6 +104,7 @@ export async function runHealingAgent<T = unknown>(
       maxRetries: 0,
       logger: console.log,
       correlationId,
+      tokenRefresher,
     });
 
     if (!result.error) {
@@ -134,6 +161,18 @@ export async function runHealingAgent<T = unknown>(
       correlationId: state.correlationId,
       cycle: observation.cycle,
     });
+    state = {
+      ...state,
+      decisionLog: [
+        ...state.decisionLog,
+        {
+          cycle: observation.cycle,
+          action: decision.action,
+          reason: decision.reason,
+          params: decision.params,
+        },
+      ],
+    };
     const { updatedState, intervention } = await executeAction(
       decision.action,
       state,

@@ -5,7 +5,6 @@ import {
   Clock,
   FlaskConical,
   Globe,
-  Key,
   RefreshCw,
   Shield,
   Sparkles,
@@ -57,7 +56,7 @@ const healingScenarioOptions = [
 const scenarioTabs = [
   { id: 'overview', label: 'Overview', icon: BarChart3 },
   { id: 'recovery', label: 'Recovery', icon: Clock },
-  { id: 'credentials', label: 'Credentials', icon: Key },
+  { id: 'credentials', label: 'Credentials', icon: Shield },
   { id: 'simulation', label: 'Simulation', icon: FlaskConical },
 ];
 
@@ -80,8 +79,6 @@ async function refreshToken(previousToken?: string | null) {
 export default function ResilienceHubPage() {
   const [activeTab, setActiveTab] = useState('overview');
   const [apiKey, setApiKey] = useState<string | null>(null);
-  const [keyLoading, setKeyLoading] = useState(false);
-  const [keyError, setKeyError] = useState<string | null>(null);
 
   const [healingScenario, setHealingScenario] = useState('preset');
   const [healingLoading, setHealingLoading] = useState(false);
@@ -96,29 +93,12 @@ export default function ResilienceHubPage() {
   const [isSimulating, setIsSimulating] = useState(false);
   const [simulationError, setSimulationError] = useState<string | null>(null);
 
-  const handleGenerateKey = useCallback(async () => {
-    setKeyLoading(true);
-    setKeyError(null);
-    try {
-      const token = await fetchTestApiKey('resilience-dashboard');
-      setApiKey(token);
-    } catch (error) {
-      setKeyError(
-        error instanceof Error ? error.message : 'Unable to generate key',
-      );
-    } finally {
-      setKeyLoading(false);
-    }
-  }, []);
-
   const handleRotateCredentials = useCallback(async () => {
     try {
       const token = await refreshToken(apiKey);
       setApiKey(token);
     } catch (error) {
-      setKeyError(
-        error instanceof Error ? error.message : 'Credential rotation failed',
-      );
+      console.error('Credential rotation failed', error);
     }
   }, [apiKey]);
 
@@ -291,32 +271,15 @@ export default function ResilienceHubPage() {
                   <div className="grid gap-4 md:grid-cols-2">
                     <div className="rounded-md border border-[#d0d7de] bg-white p-5">
                       <div className="mb-3 flex items-center gap-2">
-                        <Key className="h-4 w-4 text-[#0969da]" />
+                        <Clock className="h-4 w-4 text-[#0969da]" />
                         <h3 className="text-sm font-semibold">
-                          Generate demo API key
+                          Healing timeline
                         </h3>
                       </div>
-                      <p className="text-sm text-[#57606a]">
-                        Keys drive the FastAPI backend. Rotate anytime without
-                        touching the backend.
+                      <p className="text-sm text-[#57606a] mb-4">
+                        Live view of Gemini decisions and toolkit actions from the most recent run.
                       </p>
-                      <div className="mt-4 flex flex-col gap-3">
-                        <Button
-                          onClick={handleGenerateKey}
-                          disabled={keyLoading}
-                          className="bg-[#1a7f37] text-white hover:bg-[#1f8a3f]"
-                        >
-                          {keyLoading ? 'Issuing…' : 'Issue key'}
-                        </Button>
-                        {keyError && (
-                          <p className="text-sm text-red-600">{keyError}</p>
-                        )}
-                        {apiKey && (
-                          <code className="block rounded-md bg-[#f6f8fa] px-3 py-2 text-xs text-[#24292f]">
-                            {apiKey}
-                          </code>
-                        )}
-                      </div>
+                      <HealingTimeline logs={healingLogs} />
                     </div>
                     <div className="rounded-md border border-[#d0d7de] bg-white p-5">
                       <div className="mb-3 flex items-center gap-2">
@@ -361,7 +324,6 @@ export default function ResilienceHubPage() {
                 </div>
                 <div className="space-y-6">
                   <LiveActivityFeed events={liveEvents} maxItems={8} />
-                  <HealingTimeline logs={healingLogs} />
                 </div>
               </div>
             </div>
