@@ -3,6 +3,12 @@ import { HealingDecision, HealingObservation, HealingState } from './types';
 interface PlannerPayload {
   state: Omit<HealingState, 'options' | 'token'> & { tokenKnown: boolean };
   recentObservations: HealingObservation[];
+  request: {
+    method: string;
+    url: string;
+    headers: Record<string, string>;
+    bodyPreview?: unknown;
+  };
 }
 
 const GEMINI_URL =
@@ -20,12 +26,16 @@ You are Gemini 3, a recovery planner for unstable APIs. You receive structured f
 - refresh_token: fetch new credentials before retrying
 - switch_region: move to the next region endpoint in rotation
 - repair_payload: fix malformed payloads or missing fields
-- adapt_schema: accept response schema drift and adjust client expectations
+- rewrite_request: return a new request body/headers to fix malformed or deprecated payloads (respond with params.body)
+- adapt_schema / infer_schema: accept response schema drift and return field mappings/defaults via params.fieldMap + params.defaults
 - use_mock: return cached/mocked response
 - queue_recovery: queue request for background retry if budgets exhausted
 - abort: stop and explain why
 
 Respond with strict JSON: { "action": "<name>", "reason": "<why>", "params": { ... } }
+
+Request Summary:
+${JSON.stringify(payload.request, null, 2)}
 
 Context:
 ${JSON.stringify(payload, null, 2)}
@@ -44,6 +54,7 @@ export async function getHealingDecision(
       options: undefined as never,
     },
     recentObservations: [recentObservation],
+    request: summarizeRequest(state),
   };
 
   if (!apiKey) {
@@ -84,6 +95,15 @@ export async function getHealingDecision(
 }
 
 function heuristicDecision(observation: HealingObservation): HealingDecision {
+  const schemaHints = detectSchemaHints(observation);
+  if (schemaHints) {
+    return {
+      action: 'adapt_schema',
+      reason: 'Heuristic: schema drift hints detected',
+      params: schemaHints,
+    };
+  }
+
   const status = observation.error?.status;
   if (status === 401) {
     return {
@@ -113,8 +133,9 @@ function heuristicDecision(observation: HealingObservation): HealingDecision {
   }
   if (status === 422) {
     return {
-      action: 'repair_payload',
+      action: 'rewrite_request',
       reason: 'Heuristic: schema validation failed',
+      params: observation.triggerHints ?? {},
     };
   }
   if (status === 429) {
@@ -145,6 +166,60 @@ function sanitizeJson(raw: string) {
     return trimmed.replace(/```json/g, '').replace(/```/g, '').trim();
   }
   return trimmed;
+}
+
+function summarizeRequest(state: HealingState) {
+  const headers: Record<string, string> = {};
+  try {
+    new Headers(state.options.headers ?? undefined).forEach((value, key) => {
+      if (!['authorization', 'proxy-authorization'].includes(key.toLowerCase())) {
+        headers[key] = value;
+      }
+    });
+  } catch {
+    // ignore serialization errors
+  }
+  const body = typeof state.options.body === 'string'
+    ? state.options.body.slice(0, 400)
+    : state.options.body;
+  return {
+    method: (state.options.method || 'GET').toUpperCase(),
+    url: state.url,
+    headers,
+    bodyPreview: body,
+  };
+}
+
+function detectSchemaHints(observation: HealingObservation): Record<string, unknown> | null {
+  const detail = getObservationDetail(observation);
+  const schemaHint = detail?.schema_hint || detail?.schema || observation.triggerHints?.schema_hint;
+  if (!schemaHint) {
+    return null;
+  }
+  const fieldMap =
+    schemaHint.field_map ||
+    schemaHint.fieldMap ||
+    schemaHint.mapping ||
+    schemaHint.fields;
+  const defaults = schemaHint.defaults || schemaHint.fallbacks;
+  if (!fieldMap && !defaults) {
+    return null;
+  }
+  return {
+    fieldMap,
+    defaults,
+  };
+}
+
+function getObservationDetail(observation: HealingObservation): Record<string, any> | undefined {
+  const body = observation.error?.body;
+  if (body && typeof body === 'object') {
+    if ('detail' in body && typeof (body as any).detail === 'object') {
+      return (body as any).detail as Record<string, any>;
+    }
+    return body as Record<string, any>;
+  }
+  return undefined;
 }
 
 function getRetryBudgetRemaining(observation: HealingObservation): number | undefined {

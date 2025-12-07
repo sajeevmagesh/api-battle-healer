@@ -4,13 +4,21 @@ import {
   HealingActionType,
   HealingIntervention,
   HealingState,
+  SchemaHints,
   ToolkitContext,
 } from './types';
 import { resolveNextRegion } from './routing';
+import { requestMockResponse } from './mockClient';
 
 const DEFAULT_HEADERS = {
   'Content-Type': 'application/json',
 };
+
+const MAX_REPAIR_ATTEMPTS = 2;
+const REPAIR_WINDOW_MS = 60_000;
+const REPAIR_WINDOW_LIMIT = 4;
+const endpointRepairWindow = new Map<string, { count: number; windowStart: number }>();
+const REPAIR_HEADER = 'X-Healer-Repair-Attempt';
 
 export async function executeAction(
   action: HealingActionType,
@@ -26,10 +34,13 @@ export async function executeAction(
     case 'use_mock':
       return fetchMock(state, context, params);
     case 'repair_payload':
-      return repairPayload(state, context);
+      return repairPayload(state);
+    case 'rewrite_request':
+      return rewriteRequest(state, params);
     case 'queue_recovery':
       return queueForRecovery(state, context, params);
     case 'adapt_schema':
+    case 'infer_schema':
       return adaptSchema(state, context, params);
     case 'retry':
       return {
@@ -94,27 +105,35 @@ async function fetchMock(
   context: ToolkitContext,
   params: Record<string, unknown>,
 ) {
-  const response = await fetch(`${context.backendBaseUrl}/mock-response`, {
-    method: 'POST',
-    headers: DEFAULT_HEADERS,
-    body: JSON.stringify({
-      reason: params.reason || 'agent-degraded',
-      payload: state.cachedResponse,
-    }),
+  const degraded = await requestMockResponse(context, {
+    schema: state.schemaHints,
+    cachedPayload: state.cachedResponse,
+    provider: (params.provider as string) || 'battle-healer',
+    endpoint: (params.endpoint as string) || state.url,
+    reason: params.reason as string | undefined,
+    error: state.attempts.at(-1)?.error?.message,
   });
-  const data = await response.json();
-  const updated = { ...state, cachedResponse: data };
+  const updated = { ...state, cachedResponse: degraded.data, degraded };
   return {
     updatedState: updated,
-    intervention: createIntervention(state, 'use_mock', 'Returning degraded response'),
+    intervention: createIntervention(
+      state,
+      'use_mock',
+      degraded.reason || 'Returning degraded response',
+      { degradation: degraded.degradation },
+    ),
   };
 }
 
-async function repairPayload(
-  state: HealingState,
-) {
+async function repairPayload(state: HealingState) {
+  const guard = ensureRepairAllowance(state);
+  if (!guard.allowed) {
+    return guard.interventionPayload!;
+  }
+
   const cloned = { ...state };
   const body = state.options.body;
+
   try {
     const parsed = typeof body === 'string' ? JSON.parse(body) : body;
     if (parsed && typeof parsed === 'object') {
@@ -126,17 +145,21 @@ async function repairPayload(
       }
       cloned.options = {
         ...state.options,
+        headers: withRepairHeaders(state.options.headers, state.repairAttempts + 1),
         body: JSON.stringify(parsed),
       };
+      cloned.repairAttempts = state.repairAttempts + 1;
     }
   } catch {
     cloned.options = {
       ...state.options,
+      headers: withRepairHeaders(state.options.headers, state.repairAttempts + 1),
       body: JSON.stringify({
         transactionId: `fallback-${Date.now()}`,
         amount: 0,
       }),
     };
+    cloned.repairAttempts = state.repairAttempts + 1;
   }
 
   return {
@@ -145,19 +168,83 @@ async function repairPayload(
   };
 }
 
+async function rewriteRequest(
+  state: HealingState,
+  params: Record<string, unknown>,
+) {
+  const guard = ensureRepairAllowance(state);
+  if (!guard.allowed) {
+    return guard.interventionPayload!;
+  }
+
+  const candidateBody =
+    params.body ?? params.newBody ?? params.payload ?? params.rewrittenBody;
+  if (candidateBody == null) {
+    return {
+      updatedState: state,
+      intervention: createIntervention(
+        state,
+        'rewrite_request',
+        'Planner requested rewrite but no payload provided',
+      ),
+    };
+  }
+
+  const serialized =
+    typeof candidateBody === 'string'
+      ? candidateBody
+      : JSON.stringify(candidateBody);
+  const headers = withRepairHeaders(state.options.headers, state.repairAttempts + 1);
+  const extraHeaders = params.headers as Record<string, string> | undefined;
+  if (extraHeaders) {
+    Object.entries(extraHeaders).forEach(([key, value]) => {
+      headers.set(key, String(value));
+    });
+  }
+
+  const updated: HealingState = {
+    ...state,
+    options: {
+      ...state.options,
+      body: serialized,
+      headers,
+    },
+    repairAttempts: state.repairAttempts + 1,
+  };
+
+  return {
+    updatedState: updated,
+    intervention: createIntervention(
+      state,
+      'rewrite_request',
+      params.notes ? String(params.notes) : 'Rewriting payload per Gemini plan',
+      { notes: params.notes },
+    ),
+  };
+}
+
 async function adaptSchema(
   state: HealingState,
   context: ToolkitContext,
   params: Record<string, unknown>,
 ) {
-  const hints = {
-    ...(state.schemaHints ?? {}),
-    ...(params || {}),
+  const nextHints = mergeSchemaHints(state.schemaHints, params);
+  const updatedResponse = state.cachedResponse
+    ? applySchemaAdaptation(nextHints, state.cachedResponse)
+    : state.cachedResponse;
+  const updated = {
+    ...state,
+    schemaHints: nextHints,
+    cachedResponse: updatedResponse,
   };
-  const updated = { ...state, schemaHints: hints };
   return {
     updatedState: updated,
-    intervention: createIntervention(state, 'adapt_schema', 'Adjusting schema expectations', hints),
+    intervention: createIntervention(
+      state,
+      'adapt_schema',
+      'Adjusting schema expectations',
+      nextHints as Record<string, unknown>,
+    ),
   };
 }
 
@@ -206,6 +293,131 @@ async function queueForRecovery(
       params,
     ),
   };
+}
+
+type RepairGuardResult = {
+  allowed: boolean;
+  interventionPayload?: { updatedState: HealingState; intervention: HealingIntervention };
+};
+
+function ensureRepairAllowance(state: HealingState): RepairGuardResult {
+  if (state.repairAttempts >= MAX_REPAIR_ATTEMPTS) {
+    const intervention = createIntervention(
+      state,
+      'abort',
+      `Max repair attempts (${MAX_REPAIR_ATTEMPTS}) reached`,
+      { repairAttempts: state.repairAttempts },
+    );
+    return {
+      allowed: false,
+      interventionPayload: { updatedState: { ...state, cyclesUsed: state.maxCycles }, intervention },
+    };
+  }
+  const endpointKey = getEndpointKey(state.url);
+  const now = Date.now();
+  const existing = endpointRepairWindow.get(endpointKey);
+  if (!existing || now - existing.windowStart > REPAIR_WINDOW_MS) {
+    endpointRepairWindow.set(endpointKey, { count: 1, windowStart: now });
+    return { allowed: true };
+  }
+  if (existing.count >= REPAIR_WINDOW_LIMIT) {
+    const intervention = createIntervention(
+      state,
+      'abort',
+      'Endpoint repair throttle reached',
+      { endpoint: endpointKey },
+    );
+    return {
+      allowed: false,
+      interventionPayload: { updatedState: { ...state, cyclesUsed: state.maxCycles }, intervention },
+    };
+  }
+  existing.count += 1;
+  return { allowed: true };
+}
+
+function withRepairHeaders(headersInit: HeadersInit | undefined, attempt: number): Headers {
+  const headers = toHeaders(headersInit);
+  headers.set(REPAIR_HEADER, String(attempt));
+  return headers;
+}
+
+function toHeaders(init?: HeadersInit): Headers {
+  if (init instanceof Headers) {
+    return new Headers(init);
+  }
+  return new Headers(init ?? undefined);
+}
+
+function getEndpointKey(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url;
+  }
+}
+
+function mergeSchemaHints(
+  current: SchemaHints | undefined,
+  params: Record<string, unknown>,
+): SchemaHints {
+  const paramFieldMap =
+    (params.fieldMap as Record<string, string>) ||
+    ((params.mapping as Record<string, string>) ?? {});
+  const nestedMap =
+    ((params.schema as { fieldMap?: Record<string, string> })?.fieldMap) || {};
+  const fieldMap = {
+    ...(current?.fieldMap ?? {}),
+    ...paramFieldMap,
+    ...nestedMap,
+  };
+
+  const paramDefaults =
+    (params.defaults as Record<string, unknown>) ||
+    ((params.schema as { defaults?: Record<string, unknown> })?.defaults) ||
+    {};
+  const defaults = {
+    ...(current?.defaults ?? {}),
+    ...paramDefaults,
+  };
+
+  return {
+    fieldMap: Object.keys(fieldMap).length ? fieldMap : current?.fieldMap,
+    defaults: Object.keys(defaults).length ? defaults : current?.defaults,
+  };
+}
+
+export function applySchemaAdaptation(
+  hints: SchemaHints | undefined,
+  payload: unknown,
+): unknown {
+  if (!hints || payload == null) {
+    return payload;
+  }
+  if (Array.isArray(payload)) {
+    return payload.map((item) => applySchemaAdaptation(hints, item));
+  }
+  if (typeof payload !== 'object') {
+    return payload;
+  }
+
+  const normalized: Record<string, unknown> = {
+    ...(payload as Record<string, unknown>),
+  };
+  const fieldMap = hints.fieldMap ?? {};
+  Object.entries(fieldMap).forEach(([expected, actual]) => {
+    if (actual in normalized) {
+      normalized[expected] = normalized[actual];
+    }
+  });
+  const defaults = hints.defaults ?? {};
+  Object.entries(defaults).forEach(([key, value]) => {
+    if (normalized[key] === undefined) {
+      normalized[key] = value;
+    }
+  });
+  return normalized;
 }
 
 function headersToObject(init?: HeadersInit): Record<string, string> {
