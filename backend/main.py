@@ -29,6 +29,8 @@ from .credentials import (
   get_credential_by_token,
   get_next_credential,
   mark_credential_status_by_token,
+  note_call,
+  predict_quota_action,
   record_usage,
   seconds_until_reset,
 )
@@ -84,17 +86,20 @@ _token_rate_state: Dict[str, Dict[str, Any]] = {}
 queue_entries: Dict[str, "QueueRecord"] = {}
 queue_lock = asyncio.Lock()
 dead_entry_history: Deque[datetime] = deque(maxlen=1000)
+recent_log_events: Deque[Dict[str, Any]] = deque(maxlen=500)
 
 
 def reset_queue_state_for_tests() -> None:
   """Utility for test suites to reset queue state."""
   queue_entries.clear()
   dead_entry_history.clear()
+  recent_log_events.clear()
 
 
 def log_healing_event(event: str, **context: Any) -> None:
   payload = {"event": event, **context}
   logger.info(json.dumps(payload, default=str))
+  recent_log_events.append(payload)
 
 
 class ExternalApiResponse(BaseModel):
@@ -174,6 +179,50 @@ class QueueFailedPayload(BaseModel):
   error_status: int | None = None
   timestamp: datetime = Field(default_factory=datetime.utcnow)
   retry_count: int = 0
+
+
+class MockResponsePayload(BaseModel):
+  """Payload accepted by /mock-response."""
+
+  schema_hint: Dict[str, Any] | None = None
+  example_response: Any | None = None
+  cached_payload: Any | None = None
+  provider: str | None = None
+  endpoint: str | None = None
+  reason: str | None = None
+  error: str | None = None
+  metadata: Dict[str, Any] | None = None
+
+
+class MockResponseResult(BaseModel):
+  """Response returned from /mock-response."""
+
+  mock: Any
+  degradation: str = "mocked"
+  reason: str
+  source: str = "llm-mock"
+  original_error: str | None = None
+
+
+class LogPayload(BaseModel):
+  """Arbitrary log payload provided by the client agent."""
+
+  event: str
+  metadata: Dict[str, Any] = {}
+
+
+class QueueStatusResponse(BaseModel):
+  """Response for queue status endpoint."""
+
+  queued: int
+  running: int
+  dead_recent: int
+
+
+class LogListResponse(BaseModel):
+  """Response for retrieving logs."""
+
+  logs: List[Dict[str, Any]]
 
 
 @dataclass
@@ -322,6 +371,41 @@ def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
     for key, value in headers.items()
     if key.lower() not in blocked
   }
+
+
+def _estimate_tokens(region_label: str, body_size: int = 0) -> int:
+  base = 150 + len(region_label) * 5
+  body_component = body_size // 4
+  jitter = random.randint(10, 50)
+  return max(100, base + body_component + jitter)
+
+
+def _generate_mock_payload(payload: MockResponsePayload) -> Any:
+  base: Dict[str, Any] = {}
+  if isinstance(payload.cached_payload, dict):
+    base.update(payload.cached_payload)
+  elif isinstance(payload.example_response, dict):
+    base.update(payload.example_response)
+  elif isinstance(payload.example_response, list) and payload.example_response:
+    candidate = payload.example_response[0]
+    if isinstance(candidate, dict):
+      base.update(candidate)
+
+  schema_fields: List[str] = []
+  if isinstance(payload.schema_hint, dict):
+    schema_fields = list(payload.schema_hint.keys())
+    if "fieldMap" in payload.schema_hint and isinstance(payload.schema_hint["fieldMap"], dict):
+      schema_fields.extend(payload.schema_hint["fieldMap"].keys())
+
+  for field in schema_fields:
+    if field not in base:
+      base[field] = f"MOCK_{field.upper()}_{random.randint(100, 999)}"
+
+  if not base:
+    base["mock"] = f"MOCK_VALUE_{random.randint(1000, 9999)}"
+    base["timestamp"] = datetime.utcnow().isoformat()
+
+  return base
 
 
 def _prepare_queue_payload(payload: QueueFailedPayload) -> QueueFailedPayload:
@@ -633,7 +717,28 @@ def _handle_external_api(*, authorization: str, region_hint: str) -> ExternalApi
       headers={"Retry-After": str(retry_after)},
     )
 
-  record_usage(credential.id, tokens_used=random.randint(250, 500), call_count=1)
+  tokens_used = _estimate_tokens(region_label)
+  record_usage(credential.id, tokens_used=tokens_used, call_count=1)
+  avg_calls = note_call(credential.id)
+  quota_action = predict_quota_action(credential, avg_calls)
+  if quota_action != "allow":
+    log_healing_event(
+      "CREDENTIAL_QUOTA_SIGNAL",
+      credential_id=credential.id,
+      action=quota_action,
+      avg_calls_per_min=round(avg_calls, 2),
+      remaining_calls=(
+        (credential.max_calls_per_day or credential.daily_call_limit or 0) - credential.used_calls
+      ),
+      remaining_tokens=(
+        (credential.max_tokens_per_day or 0) - credential.used_tokens
+        if credential.max_tokens_per_day
+        else None
+      ),
+    )
+    if quota_action == "switch":
+      credential.status = "exhausted"
+      credential.reset_at = credential.reset_at or datetime.utcnow() + timedelta(minutes=15)
 
   if random.random() < 0.5:
     raise HTTPException(
@@ -725,6 +830,18 @@ async def refresh_token(payload: RefreshTokenRequest | None = None) -> RefreshTo
   )
 
 
+@app.post("/mock-response", response_model=MockResponseResult)
+async def mock_response(payload: MockResponsePayload) -> MockResponseResult:
+  """Return a synthetic response used for graceful degradation."""
+  mock_payload = _generate_mock_payload(payload)
+  reason = payload.reason or "Provider outage; synthetic mock generated"
+  return MockResponseResult(
+    mock=mock_payload,
+    reason=reason,
+    original_error=payload.error,
+  )
+
+
 @app.post("/queue-failed", status_code=status.HTTP_202_ACCEPTED)
 async def queue_failed(payload: QueueFailedPayload) -> Dict[str, str]:
   """Accept failed requests for queued recovery."""
@@ -732,11 +849,16 @@ async def queue_failed(payload: QueueFailedPayload) -> Dict[str, str]:
   return {"status": "queued", "id": record.id}
 
 
-class LogPayload(BaseModel):
-  """Arbitrary log payload provided by the client agent."""
-
-  event: str
-  metadata: Dict[str, Any] = {}
+@app.get("/queue-status", response_model=QueueStatusResponse)
+async def queue_status() -> QueueStatusResponse:
+  async with queue_lock:
+    snapshot = list(queue_entries.values())
+  queued = sum(1 for entry in snapshot if entry.status in {"queued", "retrying"})
+  running = sum(1 for entry in snapshot if entry.status == "running")
+  now = datetime.utcnow()
+  window = now - timedelta(minutes=10)
+  dead_recent = sum(1 for ts in dead_entry_history if ts >= window)
+  return QueueStatusResponse(queued=queued, running=running, dead_recent=dead_recent)
 
 
 @app.post("/log", status_code=status.HTTP_202_ACCEPTED)
@@ -744,4 +866,18 @@ async def log_event(payload: LogPayload, request: Request) -> Dict[str, str]:
   """Accept structured logs from the agent and echo acknowledgement."""
   client_host = request.client.host if request.client else "unknown"
   print(f"[agent-log] host={client_host} payload={payload.json()}")
+  recent_log_events.append({"event": payload.event, "metadata": payload.metadata, "host": client_host})
   return {"status": "accepted"}
+
+
+@app.get("/logs", response_model=LogListResponse)
+async def get_logs(
+  correlation_id: str | None = None,
+  limit: int = 50,
+) -> LogListResponse:
+  entries = list(recent_log_events)
+  if correlation_id:
+    filtered = [entry for entry in entries if entry.get("correlation_id") == correlation_id]
+  else:
+    filtered = entries
+  return LogListResponse(logs=filtered[-limit:])

@@ -1,11 +1,15 @@
 import { SmartFetchMeta, SmartFetchResult } from '../smartFetch';
+import type { DegradedResponse } from '../healing/degradedResponse';
+import type { DegradationConfig } from './degradation';
 
 export type HealingActionType =
   | 'retry'
   | 'refresh_token'
   | 'switch_region'
   | 'repair_payload'
+  | 'rewrite_request'
   | 'adapt_schema'
+  | 'infer_schema'
   | 'use_mock'
   | 'queue_recovery'
   | 'abort';
@@ -40,7 +44,9 @@ export interface HealingState {
   regionHealth: Record<string, 'healthy' | 'unhealthy' | 'deprecated'>;
   token?: string;
   cachedResponse?: unknown;
-  schemaHints?: Record<string, unknown>;
+  schemaHints?: SchemaHints;
+  repairAttempts: number;
+  degraded?: DegradedResponse<unknown>;
   attempts: HealingObservation[];
   interventions: HealingIntervention[];
   maxCycles: number;
@@ -65,11 +71,18 @@ export interface HealingAgentParams {
   maxCycles?: number;
   tokenProvider: () => Promise<string>;
   backendBaseUrl: string;
+  degradation?: DegradationConfig;
 }
 
 export interface HealingAgentResult<T = unknown> {
   success: boolean;
   data: T | null;
+  degraded: DegradedResponse<T>;
   finalError?: SmartFetchResult['error'];
   state: HealingState;
+}
+
+export interface SchemaHints {
+  fieldMap?: Record<string, string>;
+  defaults?: Record<string, unknown>;
 }

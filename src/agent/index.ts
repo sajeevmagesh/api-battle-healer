@@ -2,10 +2,18 @@ import { smartFetch } from '../smartFetch';
 import { ROUTING_TREE, findRegionByEndpoint } from '../config/routing';
 import { resolveNextRegion } from './routing';
 import { getHealingDecision } from './geminiPlanner';
-import { executeAction } from './toolkit';
+import { applySchemaAdaptation, executeAction } from './toolkit';
+import { createDegradedResponse } from '../healing/degradedResponse';
+import type { DegradedResponse } from '../healing/degradedResponse';
+import {
+  DEFAULT_DEGRADATION,
+  applyDegradationPipeline,
+  rememberSuccessfulResponse,
+} from './degradation';
 import {
   HealingAgentParams,
   HealingAgentResult,
+  HealingDecision,
   HealingObservation,
   HealingState,
 } from './types';
@@ -29,6 +37,10 @@ export async function runHealingAgent<T = unknown>(
     providedRequestId || `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const correlationId = params.correlationId || requestId;
   const initialToken = await tokenProvider();
+  const degradationConfig = params.degradation;
+
+  const makeCacheKey = (regionHint?: string) =>
+    degradationConfig?.cacheKey || `${url}::${regionHint || 'default'}`;
 
   let state: HealingState = {
     requestId,
@@ -44,6 +56,8 @@ export async function runHealingAgent<T = unknown>(
     maxCycles,
     cyclesUsed: 0,
     correlationId,
+    repairAttempts: 0,
+    degraded: createDegradedResponse<T | null>(null, 'none'),
   };
 
   while (state.cyclesUsed < state.maxCycles) {
@@ -67,17 +81,24 @@ export async function runHealingAgent<T = unknown>(
     });
 
     if (!result.error) {
+      const normalizedData = state.schemaHints
+        ? (applySchemaAdaptation(state.schemaHints, result.data) as T)
+        : result.data;
+      rememberSuccessfulResponse(makeCacheKey(currentRegionId), normalizedData, degradationConfig);
+      const degraded = createDegradedResponse(normalizedData, 'none');
       state = {
         ...state,
-        cachedResponse: result.data,
+        cachedResponse: normalizedData,
         regionHealth: {
           ...state.regionHealth,
           [currentRegionId]: 'healthy',
         },
+        degraded,
       };
       return {
         success: true,
-        data: result.data,
+        data: normalizedData,
+        degraded,
         state,
       };
     }
@@ -107,6 +128,12 @@ export async function runHealingAgent<T = unknown>(
     };
 
     const decision = await getHealingDecision(state, observation);
+    await logGeminiDecision(decision, {
+      backendBaseUrl,
+      requestId: state.requestId,
+      correlationId: state.correlationId,
+      cycle: observation.cycle,
+    });
     const { updatedState, intervention } = await executeAction(
       decision.action,
       state,
@@ -117,9 +144,11 @@ export async function runHealingAgent<T = unknown>(
     state = updatedState;
 
     if (decision.action === 'use_mock') {
+      const degraded = state.degraded ?? createDegradedResponse(state.cachedResponse as T | null, 'mocked');
       return {
         success: true,
-        data: state.cachedResponse as T,
+        data: degraded.data as T,
+        degraded: degraded as DegradedResponse<T>,
         state,
       };
     }
@@ -128,11 +157,63 @@ export async function runHealingAgent<T = unknown>(
       break;
     }
   }
+  const lastError = state.attempts.at(-1)?.error;
+  const fallback = await applyDegradationPipeline(
+    {
+      config: degradationConfig,
+      cacheKey: makeCacheKey(state.regionHistory.at(-1)),
+      lastError,
+      context: { backendBaseUrl, requestId: state.requestId, correlationId: state.correlationId },
+      state,
+    },
+  );
+  if (fallback) {
+    state = { ...state, cachedResponse: fallback.data, degraded: fallback };
+    return {
+      success: true,
+      data: fallback.data as T,
+      degraded: fallback as DegradedResponse<T>,
+      state,
+    };
+  }
+  const degraded = createDegradedResponse<T | null>(
+    null,
+    'none',
+    { originalError: lastError?.message },
+  );
 
   return {
     success: false,
     data: null,
-    finalError: state.attempts.at(-1)?.error ?? { message: 'Agent exhausted' },
+    degraded,
+    finalError: lastError ?? { message: 'Agent exhausted' },
     state,
   };
+}
+
+async function logGeminiDecision(
+  decision: HealingDecision,
+  context: { backendBaseUrl: string; requestId: string; correlationId: string; cycle: number },
+) {
+  try {
+    await fetch(`${context.backendBaseUrl}/log`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        event: "gemini_decision",
+        metadata: {
+          requestId: context.requestId,
+          correlationId: context.correlationId,
+          cycle: context.cycle,
+          action: decision.action,
+          reason: decision.reason,
+          params: decision.params,
+        },
+      }),
+    });
+  } catch (error) {
+    console.warn("Failed to log Gemini decision", error);
+  }
 }

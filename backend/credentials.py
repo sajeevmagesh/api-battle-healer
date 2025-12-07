@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+import logging
+import time
+from typing import Any, Deque, Dict, List, Optional
+from collections import deque
+
+logger = logging.getLogger("credential-pool")
 
 
 @dataclass
@@ -12,8 +17,13 @@ class Credential:
   model: str
   api_key: str
   status: str = "active"  # active | exhausted | disabled
+  tier: str = "primary"
   daily_call_limit: Optional[int] = None
+  max_calls_per_day: Optional[int] = None
+  max_tokens_per_day: Optional[int] = None
+  estimated_cost_per_1k_tokens: Optional[float] = None
   used_calls: int = 0
+  used_tokens: int = 0
   reset_at: Optional[datetime] = None
   last_rotated_at: Optional[datetime] = None
   total_calls: int = 0
@@ -25,6 +35,15 @@ credential_pool: Dict[str, Credential] = {}
 token_to_id: Dict[str, str] = {}
 credential_order: List[str] = []
 _cursor_index = 0
+call_rate_window: Dict[str, Deque[float]] = {}
+
+TIER_PRIORITY = {
+  "primary": 0,
+  "backup": 1,
+  "free-tier": 2,
+}
+
+NEAR_QUOTA_THRESHOLD = 0.9
 
 
 def _register_credential(credential: Credential) -> None:
@@ -39,6 +58,25 @@ def _auto_reset(credential: Credential) -> None:
     credential.reset_at = None
     if credential.status == "exhausted":
       credential.status = "active"
+      credential.used_tokens = 0
+
+
+def _tier_priority(tier: str) -> int:
+  return TIER_PRIORITY.get(tier, 99)
+
+
+def _effective_call_limit(credential: Credential) -> Optional[int]:
+  return credential.max_calls_per_day or credential.daily_call_limit
+
+
+def _is_near_quota(credential: Credential) -> bool:
+  call_limit = _effective_call_limit(credential)
+  token_limit = credential.max_tokens_per_day
+  if call_limit and credential.used_calls >= call_limit * NEAR_QUOTA_THRESHOLD:
+    return True
+  if token_limit and credential.used_tokens >= token_limit * NEAR_QUOTA_THRESHOLD:
+    return True
+  return False
 
 
 def seed_default_credentials() -> None:
@@ -49,6 +87,9 @@ def seed_default_credentials() -> None:
       model="standard",
       api_key="new-token-abc",
       daily_call_limit=200,
+      max_tokens_per_day=250_000,
+      tier="primary",
+      estimated_cost_per_1k_tokens=0.6,
     ),
     Credential(
       id="cred-secondary",
@@ -56,6 +97,9 @@ def seed_default_credentials() -> None:
       model="standard",
       api_key="token-backup-xyz",
       daily_call_limit=150,
+      max_tokens_per_day=200_000,
+      tier="backup",
+      estimated_cost_per_1k_tokens=0.5,
     ),
     Credential(
       id="cred-spiky",
@@ -63,6 +107,9 @@ def seed_default_credentials() -> None:
       model="standard",
       api_key="spiky-token",
       daily_call_limit=20,
+      tier="free-tier",
+      max_tokens_per_day=25_000,
+      estimated_cost_per_1k_tokens=0.1,
     ),
     Credential(
       id="cred-chatty",
@@ -70,6 +117,9 @@ def seed_default_credentials() -> None:
       model="standard",
       api_key="chatty-token",
       daily_call_limit=40,
+      tier="free-tier",
+      max_tokens_per_day=30_000,
+      estimated_cost_per_1k_tokens=0.1,
     ),
     Credential(
       id="cred-blocked",
@@ -127,6 +177,7 @@ def get_next_credential(provider: str, model: Optional[str] = None) -> Optional[
     return None
 
   total = len(credential_order)
+  candidates: List[Credential] = []
   for offset in range(total):
     idx = (_cursor_index + offset) % total
     credential_id = credential_order[idx]
@@ -138,13 +189,48 @@ def get_next_credential(provider: str, model: Optional[str] = None) -> Optional[
       continue
     if credential.status != "active":
       continue
-    if credential.daily_call_limit and credential.used_calls >= credential.daily_call_limit:
+    call_limit = _effective_call_limit(credential)
+    if call_limit and credential.used_calls >= call_limit:
       credential.status = "exhausted"
       credential.reset_at = credential.reset_at or (datetime.utcnow() + timedelta(hours=1))
+      logger.info(
+        "credential_exhausted_calls id=%s used=%s limit=%s",
+        credential.id,
+        credential.used_calls,
+        call_limit,
+      )
       continue
-    credential.last_rotated_at = datetime.utcnow()
-    _cursor_index = (idx + 1) % total
-    return credential
+    if credential.max_tokens_per_day and credential.used_tokens >= credential.max_tokens_per_day:
+      credential.status = "exhausted"
+      credential.reset_at = credential.reset_at or (datetime.utcnow() + timedelta(hours=1))
+      logger.info(
+        "credential_exhausted_tokens id=%s used=%s limit=%s",
+        credential.id,
+        credential.used_tokens,
+        credential.max_tokens_per_day,
+      )
+      continue
+    candidates.append(credential)
+
+  if not candidates:
+    return None
+
+  non_near = [cred for cred in candidates if not _is_near_quota(cred)]
+  subset = non_near or candidates
+  subset.sort(key=lambda cred: (_tier_priority(cred.tier), cred.last_rotated_at or datetime.min))
+  chosen = subset[0]
+  if _is_near_quota(chosen):
+    logger.info(
+      "credential_near_quota id=%s tier=%s used_calls=%s used_tokens=%s",
+      chosen.id,
+      chosen.tier,
+      chosen.used_calls,
+      chosen.used_tokens,
+    )
+  chosen.last_rotated_at = datetime.utcnow()
+  _cursor_index = (credential_order.index(chosen.id) + 1) % total
+  return chosen
+
   return None
 
 
@@ -179,6 +265,25 @@ def mark_credential_status_by_token(
     mark_credential_status(credential_id, status, reason=reason, cooldown_seconds=cooldown_seconds)
 
 
+def note_call(credential_id: str) -> float:
+  now = time.monotonic()
+  history = call_rate_window.setdefault(credential_id, deque())
+  history.append(now)
+  while history and now - history[0] > 120:
+    history.popleft()
+  return get_average_calls_per_minute(credential_id)
+
+
+def get_average_calls_per_minute(credential_id: str) -> float:
+  history = call_rate_window.get(credential_id)
+  if not history or len(history) < 2:
+    return float(len(history or []))
+  window_seconds = history[-1] - history[0]
+  if window_seconds <= 0:
+    return float(len(history))
+  return (len(history) - 1) / (window_seconds / 60)
+
+
 def record_usage(
   credential_id: str,
   *,
@@ -191,11 +296,46 @@ def record_usage(
   credential.total_calls += call_count
   credential.total_tokens += tokens_used
   credential.used_calls += call_count
-  if credential.daily_call_limit and credential.used_calls >= credential.daily_call_limit:
+  credential.used_tokens += tokens_used
+  call_limit = _effective_call_limit(credential)
+  if call_limit and credential.used_calls >= call_limit:
+    credential.status = "exhausted"
+    credential.reset_at = datetime.utcnow() + timedelta(hours=1)
+  if credential.max_tokens_per_day and credential.used_tokens >= credential.max_tokens_per_day:
     credential.status = "exhausted"
     credential.reset_at = datetime.utcnow() + timedelta(hours=1)
   return credential
 
 
-seed_default_credentials()
+def predict_quota_action(credential: Credential, avg_calls_per_minute: float) -> str:
+  call_limit = _effective_call_limit(credential)
+  remaining_calls = call_limit - credential.used_calls if call_limit else None
+  remaining_tokens = (
+    credential.max_tokens_per_day - credential.used_tokens
+    if credential.max_tokens_per_day
+    else None
+  )
 
+  if remaining_calls is not None and remaining_calls <= 0:
+    return "switch"
+  if remaining_tokens is not None and remaining_tokens <= 0:
+    return "switch"
+
+  if remaining_calls is not None and avg_calls_per_minute > 0:
+    minutes_left = remaining_calls / avg_calls_per_minute
+    if minutes_left < 5:
+      return "switch"
+    if minutes_left < 15:
+      return "throttle"
+
+  if remaining_tokens is not None:
+    usage_ratio = remaining_tokens / credential.max_tokens_per_day
+    if usage_ratio <= 0.05:
+      return "switch"
+    if usage_ratio <= 0.15:
+      return "throttle"
+
+  return "allow"
+
+
+seed_default_credentials()

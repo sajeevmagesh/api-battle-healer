@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { smartFetch, SmartFetchResult, type TokenRecoveryContext } from '../src/smartFetch';
+import { type SmartFetchResult } from '../src/smartFetch';
+import { runHealingAgent } from '../src/agent';
+import type { HealingState } from '../src/agent/types';
+import type { DegradedResponse } from '../src/healing/degradedResponse';
 import { ROUTING_TREE, flattenRoutingTree } from '../src/config/routing';
 
 type ApiResult = SmartFetchResult<Record<string, unknown>>;
@@ -33,6 +36,7 @@ const INITIAL_SESSION_KEY = 'session-initial';
 const ROUTING_PRESET = ROUTING_TREE.children
   ?.map((node) => node.endpoint)
   .join(', ') ?? 'http://localhost:8000';
+const BACKEND_BASE_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
 
 export default function TestHealingPage() {
   const [result, setResult] = useState<ApiResult | null>(null);
@@ -45,6 +49,8 @@ export default function TestHealingPage() {
   const [retryBudgetWindowSeconds, setRetryBudgetWindowSeconds] = useState(60);
   const [regionsInput, setRegionsInput] = useState('http://localhost:8000');
   const [sessionKey, setSessionKey] = useState(INITIAL_SESSION_KEY);
+  const [agentState, setAgentState] = useState<HealingState | null>(null);
+  const [degradedInfo, setDegradedInfo] = useState<DegradedResponse<Record<string, unknown>> | null>(null);
 
   useEffect(() => {
     setSessionKey(makeSessionKey());
@@ -70,48 +76,63 @@ export default function TestHealingPage() {
   const handleClick = async () => {
     setIsLoading(true);
     setResult(null);
+    setAgentState(null);
+    setDegradedInfo(null);
     try {
-      const tokenRefresher = async (context: TokenRecoveryContext) => {
-        const res = await fetch('http://localhost:8000/refresh-token', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            previous_token: context.previousToken,
-            failure_status: context.status,
-            attempt: context.attempt,
-          }),
-        });
-        if (!res.ok) {
-          throw new Error('Failed to refresh or rotate token');
-        }
-        const data = (await res.json()) as { token: string };
-        return data.token;
+      const baseRequestInit: RequestInit = {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${activeToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          transactionId: 'heal-test',
+          amount: 1337,
+        }),
       };
-
-      const response = await smartFetch(
-        '/external-api',
-        {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${activeToken}`,
-          },
+      const targetPath = '/external-api?simulate=region_down,retryable_500,schema_drift,repair';
+      const agentResult = await runHealingAgent<Record<string, unknown>>({
+        url: targetPath,
+        options: baseRequestInit,
+        regions: regionList,
+        requestId: sessionKey,
+        correlationId: sessionKey,
+        maxCycles: maxRetries + 1,
+        tokenProvider: async () => activeToken,
+        backendBaseUrl: BACKEND_BASE_URL,
+        degradation: {
+          enableStaleCache: true,
+          enableMock: true,
+          cacheKey: `${targetPath}-${activeToken}`,
         },
-        {
-          regions: regionList,
-          maxRetries,
-          logger: console.log,
-          tokenRefresher,
-          jitterRatio: 0.35,
-          retryBudget: {
-            key: `${sessionKey}-${activeToken}`,
-            limit: retryBudgetLimit,
-            windowMs: retryBudgetWindowSeconds * 1_000,
-          },
-        },
+      });
+      setAgentState(agentResult.state);
+      setDegradedInfo(agentResult.degraded as DegradedResponse<Record<string, unknown>>);
+      const aggregatedAttempts = agentResult.state.attempts.flatMap(
+        (observation) => observation.meta.attempts,
       );
-      setResult(response);
+      const aggregatedFixes = Array.from(
+        new Set(
+          agentResult.state.attempts.flatMap(
+            (observation) => observation.meta.fixActions,
+          ),
+        ),
+      );
+      const meta = agentResult.state.attempts.at(-1)?.meta ?? {
+        attempts: aggregatedAttempts,
+        retries: agentResult.state.attempts.length,
+        region: agentResult.state.regionHistory.at(-1) ?? 'default',
+        regionsTried: agentResult.state.regionHistory,
+        fixActions: aggregatedFixes,
+        correlationId: agentResult.state.correlationId,
+      };
+      setResult({
+        data: agentResult.data,
+        meta,
+        error: agentResult.success
+          ? null
+          : agentResult.finalError ?? { message: 'Agent exhausted' },
+      });
     } catch (error) {
       setResult({
         data: null,
@@ -124,6 +145,7 @@ export default function TestHealingPage() {
           region: 'default',
           regionsTried: [],
           fixActions: [],
+          correlationId: sessionKey,
         },
       });
     } finally {
@@ -139,9 +161,8 @@ export default function TestHealingPage() {
     <main style={{ padding: '2rem', fontFamily: 'sans-serif' }}>
       <h1>Self-Healing API Playground</h1>
       <p>
-        Configure a scenario and run <code>smartFetch</code> to visualize how retries,
-        token rotation, budgets, and region fallback behave against the FastAPI mock
-        server.
+        Configure a scenario and let the Gemini-powered healing agent drive <code>smartFetch</code>
+        through retries, token rotation, budgets, and region fallback against the FastAPI mock server.
       </p>
 
       <section
@@ -213,6 +234,7 @@ export default function TestHealingPage() {
               </button>
             </small>
           </label>
+
         </div>
       </section>
 
@@ -275,7 +297,7 @@ export default function TestHealingPage() {
       >
         <h2>Run Scenario</h2>
         <button onClick={handleClick} disabled={isLoading}>
-          {isLoading ? 'Testing…' : 'Test smartFetch'}
+          {isLoading ? 'Testing…' : 'Run healing agent'}
         </button>
         <span style={{ marginLeft: '1rem' }}>
           Active token:&nbsp;
@@ -284,7 +306,10 @@ export default function TestHealingPage() {
       </section>
 
       <section>
-        <h2>Result</h2>
+                <button type="button" onClick={() => window.open('/api/heal-runner', '_blank')} style={{ marginLeft: '1rem' }}>
+          View raw agent output
+        </button>
+<h2>Result</h2>
         {!result && (
           <p style={{ fontStyle: 'italic' }}>No request yet.</p>
         )}
@@ -318,9 +343,36 @@ export default function TestHealingPage() {
                     : 'None'
                 }
               />
+              {degradedInfo && (
+                <StatCard
+                  label="Degradation"
+                  value={
+                    degradedInfo.degradation === 'none'
+                      ? 'none'
+                      : `${degradedInfo.degradation}${
+                          degradedInfo.source ? ` (${degradedInfo.source})` : ''
+                        }`
+                  }
+                />
+              )}
             </div>
 
             <AttemptsTable result={result} />
+
+            {degradedInfo && degradedInfo.degradation !== 'none' && (
+              <div
+                style={{
+                  marginTop: '1rem',
+                  padding: '0.75rem',
+                  borderRadius: 6,
+                  background: '#fff6e6',
+                  border: '1px solid #f3c98b',
+                }}
+              >
+                <strong>Degraded response:</strong>{' '}
+                {degradedInfo.reason || 'Fallback engaged due to upstream failure.'}
+              </div>
+            )}
 
             <details style={{ marginTop: '1.5rem' }}>
               <summary>Raw response payload</summary>
@@ -339,6 +391,48 @@ export default function TestHealingPage() {
           </>
         )}
       </section>
+
+      {agentState && (
+        <section
+          style={{
+            marginTop: '2rem',
+            border: '1px solid #ddd',
+            borderRadius: 8,
+            padding: '1rem',
+          }}
+        >
+          <h2>Healing Agent Interventions</h2>
+          <p>
+            Correlation ID: <code>{agentState.correlationId}</code>
+          </p>
+          <p>
+            Region history: {agentState.regionHistory.join(' → ') || 'default'}
+          </p>
+          <p>
+            Schema hints:{' '}
+            {agentState.schemaHints
+              ? JSON.stringify(agentState.schemaHints)
+              : 'None'}
+          </p>
+          {agentState.degraded && (
+            <p>
+              Degradation level: <strong>{agentState.degraded.degradation}</strong>
+              {agentState.degraded.reason ? ` — ${agentState.degraded.reason}` : ''}
+            </p>
+          )}
+          {agentState.interventions.length ? (
+            <ul>
+              {agentState.interventions.map((intervention) => (
+                <li key={`${intervention.cycle}-${intervention.action}`}>
+                  <strong>{intervention.action}</strong> — {intervention.reason}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p style={{ fontStyle: 'italic' }}>No interventions recorded.</p>
+          )}
+        </section>
+      )}
     </main>
   );
 }
@@ -365,10 +459,9 @@ function StatCard({ label, value }: { label: string; value: string }) {
 function AttemptsTable({ result }: { result: ApiResult }) {
   if (!result.meta.attempts.length) {
     return (
-      <p style={{ fontStyle: 'italic' }}>
-        No attempts recorded. Check the console for potential errors running
-        smartFetch.
-      </p>
+          <p style={{ fontStyle: 'italic' }}>
+            No attempts recorded. Check the console for potential errors running the healing agent.
+          </p>
     );
   }
 
